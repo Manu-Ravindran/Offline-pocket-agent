@@ -56,7 +56,10 @@ class DocumentExtractor(private val context: Context, private val limits: Extrac
         output.add("image OCR", text.trim(), "image_ocr")
         if (text.isBlank()) output.warnings += "No readable text was found in this image."
         output.warnings += "Image import currently extracts printed Latin-script text. General visual understanding requires a vision model."
-        return ExtractedDocument(displayName, "image", output.sections, output.warnings.distinct(), file.absolutePath)
+        return ExtractedDocument(
+            displayName, "image", output.sections, output.warnings.distinct(), file.absolutePath,
+            extractionComplete = output.extractionComplete && text.isNotBlank(),
+        )
     }
 
     private fun decodeBoundedImage(file: File): Bitmap {

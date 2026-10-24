@@ -7,10 +7,21 @@ A private, offline Android chat assistant for Word documents, Excel workbooks, P
 - One white chat screen, a fixed composer, camera/file attachments, and a custom adaptive launcher icon.
 - Answers stream into the conversation. Stop cancels generation.
 - Model configuration lives in Settings. Import the model once; saved models load automatically when the app opens.
-- The loaded model and conversation survive screen rotation. New conversation clears the current chat context.
+- The loaded model and conversation survive screen rotation. New conversation clears messages, attachments, and native model context while retaining the loaded weights. Stored imports from other chats are never a request's default scope.
 - Attachment chips open extracted text previews. Sources and actions are available from the answer.
+- Completed answers render headings, lists, code, and horizontally scrollable tables. Every answer has **Copy**, **Download**, and **Share** controls.
 
-Ordinary chat and document questions use one model pass with preselected evidence. Simple explicit spreadsheet range sums use decimal arithmetic without calling the model. Other calculation requests retain a bounded agent tool loop. Batched prompt processing replaces the previous one-token-at-a-time vision configuration. These changes reduce avoidable work; latency and sustained heat still need measurement on the phone.
+## Full-document summaries and output
+
+Ask **“Summarize this entire document in detail”** to process every available extracted section rather than retrieve five excerpts. Full-summary processing supports PDFs up to **20 pages per document**, with bounded reading batches, hierarchical combination of all batch notes, and a larger final response budget. A 21-page PDF needs a smaller page selection for a full summary; targeted questions remain available. Word pagination is not reliable from OOXML text, so Word coverage is reported by extracted sections.
+
+The app reports page/section coverage and known extraction limits. Empty OCR, truncated extraction, unreadable pages, or unsupported embedded content prevent a claim that the original document was fully understood. Existing file/text limits below still apply. Reading every source batch does not guarantee perfect factual retention by the model.
+
+Ask **“Give the full summary in a table”** or **“Put it in tabular format”** to request a Markdown table that the app renders as native rows and columns. Document-backed table follow-ups use the full-document reading path. Full summaries use several model calls and show batch progress; they take longer than short questions, especially on CPU. Stop cancels the operation.
+
+Use **Copy** for formatted text, Markdown, or spreadsheet-friendly table text. **Download** opens Android's document picker so you can save to Downloads or another chosen location; formats include Markdown, plain text, a formatted static HTML document, and table CSV. **Share** grants another chosen app read access to a generated export copy. HTML is escaped and contains no scripts; formula-like CSV/TSV values are protected for spreadsheet use. Very large or ragged tables fall back to complete raw text instead of creating an oversized grid or discarding content.
+
+Ordinary chat and targeted document questions use one model pass with preselected evidence; full summaries use the multi-pass path above. Simple explicit spreadsheet range sums use decimal arithmetic without calling the model. Other calculation requests retain a bounded agent tool loop. Batched prompt processing reduces avoidable work; latency and sustained heat still need measurement on the phone.
 
 ## Download and install from your phone
 
@@ -45,6 +56,8 @@ This security baseline accepts the following exact [Unsloth Qwen3.5-4B files](ht
 | Matching vision file, about 672 MB | [mmproj-F16.gguf](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-F16.gguf?download=true) | `cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864` |
 
 In Settings choose the model, optionally choose its matching vision file, and import. The app verifies SHA-256 before opening files with the native inference runtime. Custom GGUF files are rejected in this baseline. Existing saved models from an earlier installation are verified once when first loaded by the new code; private verification records avoid rereading gigabytes on every launch. Keep roughly 8 GB free for downloads and imported copies.
+
+The GGUF is one Qwen backbone for conversation and document work. Its matching vision file enables image input on that same backbone; a second language-model download is not required. Generic questions such as **“Analyze this”**, **“Summarize this”**, or **“Make a table from this”** use the attached image when it is the active context. The app queries the runtime's actual vision capability instead of assuming that a created wrapper means the projector loaded. A failed projector produces a visible warning while text conversation remains available.
 
 The runtime is pinned to [Qualcomm GenieX v0.9.3](https://github.com/qualcomm/GenieX/releases/tag/v0.9.3), and CI checks the AAR's SHA-256. CPU execution remains explicit; NPU/GPU acceleration is a later device benchmark rather than a claimed feature.
 
@@ -87,5 +100,8 @@ gradle --continue testDebugUnitTest lintDebug lintRelease assembleDebug assemble
 1. Install Preview alongside the original app; import the known model and matching vision file once.
 2. Close and reopen it. Check automatic model loading, chat history during rotation, streaming, and Stop.
 3. Test a Word file, a known Excel range total, a text PDF, a scanned PDF, and a camera image. Inspect their sources and extracted text.
-4. Repeat in airplane mode. Record time to first visible text and total answer time for a greeting, a document question, and an image question.
-5. Confirm invalid model files and malformed/oversized documents produce a bounded error.
+4. Start a new conversation and attach a different file. Check that the old attachment and its facts are absent, while the model stays loaded.
+5. Summarize a 20-page test PDF whose final page contains a distinctive fact; inspect coverage and check that the fact survives. Ask for a table, then Copy and Download it.
+6. Attach an image with little printed text and ask **“What is this?”** and **“Analyze this image in a table.”** Check the actual visual answer and any projector warning.
+7. Repeat in airplane mode. Record time to first visible text and total answer time for a greeting, a targeted document question, a full summary, and an image question.
+8. Confirm invalid model files and malformed/oversized documents produce a bounded error.

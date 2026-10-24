@@ -4,6 +4,7 @@ import android.app.AlertDialog
 import android.app.Application
 import android.app.Dialog
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -15,6 +16,8 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
+import android.os.PersistableBundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.text.InputType
@@ -45,15 +48,25 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
+import com.offline.pocketagent.output.AnswerExport
+import com.offline.pocketagent.output.AnswerExportCache
+import com.offline.pocketagent.output.AnswerExports
+import com.offline.pocketagent.output.ExportDestinationPolicy
+import com.offline.pocketagent.output.MarkdownBlock
+import com.offline.pocketagent.output.MarkdownDocument
+import com.offline.pocketagent.output.NativeMarkdownRenderer
+import com.offline.pocketagent.output.PendingAnswerExport
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class PocketChatMessage(
     val id: Long,
@@ -88,6 +101,8 @@ class PocketChatViewModel(application: Application) : AndroidViewModel(applicati
     private var initialized = false
     var stagedModel: Uri? = null
     var stagedProjector: Uri? = null
+    var pendingDownload: PendingAnswerExport? = null
+    private val exportCache = AnswerExportCache(application.cacheDir)
 
     fun initialize() {
         if (initialized) return
@@ -135,11 +150,11 @@ class PocketChatViewModel(application: Application) : AndroidViewModel(applicati
         val projector = stagedProjector
         startOperation("model") {
             _status.value = "Importing your model…"
-            controller.configureModel(model, projector)
+            val result = controller.configureModel(model, projector)
             stagedModel = null
             stagedProjector = null
             _state.update { it.copy(modelReady = true, hasModel = true) }
-            notice("Your local model is ready. You only need to import it once.")
+            notice(result)
         }
     }
 
@@ -154,13 +169,14 @@ class PocketChatViewModel(application: Application) : AndroidViewModel(applicati
         val replyId = nextId.incrementAndGet()
         val user = PocketChatMessage(nextId.incrementAndGet(), "user", question.trim())
         val assistant = PocketChatMessage(replyId, "assistant", "", pending = true)
+        val attachmentIds = _state.value.documents.map { it.id }
         _state.update { it.copy(busy = true, operation = "generation", error = null,
             messages = (it.messages + user + assistant).takeLast(60)) }
         _status.value = "Thinking…"
         operationJob = viewModelScope.launch {
             val lastPartial = AtomicLong(0)
             try {
-                val answer = controller.ask(question.trim(), onPartial = { partial ->
+                val answer = controller.ask(question.trim(), documentIds = attachmentIds, onPartial = { partial ->
                     val now = SystemClock.uptimeMillis()
                     val previous = lastPartial.get()
                     if (now - previous >= 50 && lastPartial.compareAndSet(previous, now)) {
@@ -190,10 +206,45 @@ class PocketChatViewModel(application: Application) : AndroidViewModel(applicati
 
     fun dismissError() = _state.update { it.copy(error = null) }
     fun reportError(message: String) = _state.update { it.copy(error = message) }
+    suspend fun previewDocument(id: String): String {
+        check(!_state.value.busy) { "Finish the current action before opening this preview." }
+        _state.update { it.copy(busy = true, operation = "preview") }
+        _status.value = "Opening extracted text…"
+        return try { controller.previewDocument(id) } finally { finishOperation() }
+    }
     fun newChat() {
         if (_state.value.busy) return
+        _state.update { it.copy(documents = emptyList(), messages = emptyList(), error = null) }
         controller.clearConversation()
-        _state.update { it.copy(messages = emptyList(), error = null) }
+    }
+
+    fun clearImportedFiles() = startOperation("clear") {
+        val count = controller.clearImportedDocuments()
+        _state.update { it.copy(documents = emptyList(), messages = emptyList()) }
+        notice("Removed $count imported ${if (count == 1) "copy" else "copies"}. Your original files and saved model are unchanged.")
+    }
+
+    suspend fun stageExport(export: AnswerExport): PendingAnswerExport = withContext(Dispatchers.IO) { exportCache.stage(export) }
+    fun exportFile(export: PendingAnswerExport): File = exportCache.file(export)
+    fun discardExport(export: PendingAnswerExport?) = exportCache.discard(export)
+
+    fun saveExport(uri: Uri, export: PendingAnswerExport) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    ExportDestinationPolicy.requireExternalContent(uri.scheme, uri.authority,
+                        "${getApplication<Application>().packageName}.files")
+                    exportCache.file(export).inputStream().use { input ->
+                        requireNotNull(getApplication<Application>().contentResolver.openOutputStream(uri, "wt")) {
+                            "The selected destination could not be opened."
+                        }.use { output -> input.copyTo(output) }
+                    }
+                }
+                notice("Saved ${export.fileName}.")
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { reportError(error.message ?: "The answer could not be saved.") }
+            finally { exportCache.discard(export) }
+        }
     }
 
     private fun notice(text: String) = _state.update { it.copy(
@@ -264,11 +315,13 @@ class MainActivity : ComponentActivity() {
     private val muted = color("#73808C")
     private val line = color("#EAF0F3")
     private val soft = color("#F4F7F9")
+    private val markdownRenderer by lazy { NativeMarkdownRenderer(this) }
 
     private data class MessageViews(
         val root: View, val body: TextView, val activity: LinearLayout? = null,
         val activityLabel: TextView? = null, val actions: LinearLayout? = null,
         val sources: Button? = null, val details: Button? = null,
+        val formatted: LinearLayout? = null,
         var displayed: PocketChatMessage? = null,
     )
 
@@ -288,6 +341,13 @@ class MainActivity : ComponentActivity() {
         if (captured && uri != null) chat.importDocuments(listOf(uri), cleanup = { file?.delete() })
         else file?.delete()
     }
+    private val createAnswerDocument = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val pending = chat.pendingDownload
+        chat.pendingDownload = null
+        val uri = result.data?.data
+        if (result.resultCode == RESULT_OK && uri != null && pending != null) chat.saveExport(uri, pending)
+        else chat.discardExport(pending)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -296,6 +356,14 @@ class MainActivity : ComponentActivity() {
         cameraFile = savedInstanceState?.getString("cameraFile")?.takeIf {
             it.matches(Regex("capture-[A-Za-z0-9-]+\\.jpg"))
         }?.let { File(File(cacheDir, "camera"), it) }
+        if (chat.pendingDownload == null) {
+            val cacheName = savedInstanceState?.getString("exportCacheName")
+            val fileName = savedInstanceState?.getString("exportFileName")
+            val mime = savedInstanceState?.getString("exportMime")
+            if (cacheName != null && fileName != null && mime != null) {
+                chat.pendingDownload = PendingAnswerExport(fileName, mime, cacheName)
+            }
+        }
         createContent()
         savedInstanceState?.getString("draft")?.let(questionInput::setText)
         lifecycleScope.launch {
@@ -466,7 +534,12 @@ class MainActivity : ComponentActivity() {
             }
             if (views.displayed != message) {
                 if (views.body.text.toString() != message.text) views.body.text = message.text
-                views.body.visibility = if (message.pending && message.text.isBlank()) View.GONE else View.VISIBLE
+                val formatCompleted = views.formatted != null && !message.pending && !message.error
+                if (formatCompleted && (views.displayed?.pending != false || views.displayed?.text != message.text)) {
+                    markdownRenderer.render(message.text, views.formatted!!)
+                }
+                views.formatted?.visibility = if (formatCompleted) View.VISIBLE else View.GONE
+                views.body.visibility = if (formatCompleted || (message.pending && message.text.isBlank())) View.GONE else View.VISIBLE
                 views.activity?.visibility = if (message.pending) View.VISIBLE else View.GONE
                 views.activityLabel?.text = latestStatus
                 views.actions?.visibility = if (!message.pending && !message.error && message.text.isNotBlank()) View.VISIBLE else View.GONE
@@ -529,7 +602,11 @@ class MainActivity : ComponentActivity() {
         val activityLabel = label("Thinking…", 12).apply { setTextColor(muted) }
         activity.addView(activityLabel, LinearLayout.LayoutParams(-1, -2))
         bubble.addView(activity, fullWidth(bottom = 8)); bubble.addView(body, fullWidth())
-        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val formatted = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        bubble.addView(formatted, fullWidth())
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val outputActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val metadataActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val sources = textButton("Sources") {
             chat.state.value.messages.firstOrNull { it.id == message.id }?.let { showTextDialog("Sources", it.sources.joinToString("\n\n")) }
         }
@@ -539,13 +616,24 @@ class MainActivity : ComponentActivity() {
             }
         }
         val copy = textButton("Copy") {
-            chat.state.value.messages.firstOrNull { it.id == message.id }?.let {
-                (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Pocket Agent answer", it.text))
-            }
+            chat.state.value.messages.firstOrNull { it.id == message.id }?.let(::copyAnswer)
         }
-        actions.addView(sources); actions.addView(details); actions.addView(copy)
+        val download = textButton("Download") {
+            chat.state.value.messages.firstOrNull { it.id == message.id }?.let { chooseExport(it, share = false) }
+        }.apply { contentDescription = "Download or save this answer" }
+        val share = textButton("Share") {
+            chat.state.value.messages.firstOrNull { it.id == message.id }?.let { chooseExport(it, share = true) }
+        }
+        listOf(copy, download, share).forEachIndexed { index, button ->
+            button.setTextColor(teal)
+            button.background = ripple(shape(color("#E8F3F0"), 10))
+            outputActions.addView(button, LinearLayout.LayoutParams(0, -2, 1f).apply { if (index > 0) marginStart = dp(6) })
+        }
+        metadataActions.addView(sources); metadataActions.addView(details)
+        actions.addView(outputActions, fullWidth(top = 5))
+        actions.addView(metadataActions, fullWidth(top = 2))
         bubble.addView(actions, fullWidth(top = 6)); row.addView(bubble, LinearLayout.LayoutParams(-1, -2))
-        return MessageViews(row, body, activity, activityLabel, actions, sources, details)
+        return MessageViews(row, body, activity, activityLabel, actions, sources, details, formatted)
     }
 
     private fun renderAttachments(documents: List<ImportedDocument>) {
@@ -565,7 +653,7 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(7) })
             chip.setOnClickListener {
                 if (!chat.state.value.busy) lifecycleScope.launch {
-                    try { showTextDialog(document.name, chat.controller.previewDocument(document.id)) }
+                    try { showTextDialog(document.name, chat.previewDocument(document.id)) }
                     catch (cancelled: CancellationException) { throw cancelled }
                     catch (error: Exception) { chat.reportError(error.message ?: "This document preview could not be opened.") }
                 }
@@ -635,7 +723,14 @@ class MainActivity : ComponentActivity() {
         if (state.busy) panel.addView(label("${latestStatus}\nYou can stop the current action from the chat screen.", 12).apply { setTextColor(muted) }, fullWidth(top = 12))
         panel.addView(View(this).apply { setBackgroundColor(line) }, LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(19); bottomMargin = dp(7) })
         panel.addView(textButton("New conversation") { dialog.dismiss(); chat.newChat() }.apply { isEnabled = !state.busy }, fullWidth())
-        panel.addView(label("Your documents remain available in a new conversation.", 11).apply { setTextColor(muted) }, fullWidth(top = 3))
+        panel.addView(label("A new conversation starts without earlier messages or attachments. Your model stays loaded.", 11).apply { setTextColor(muted) }, fullWidth(top = 3))
+        panel.addView(textButton("Clear imported files") {
+            dialog.dismiss()
+            AlertDialog.Builder(this).setTitle("Clear imported files?")
+                .setMessage("Delete this app’s imported document and image copies and clear this conversation. Your original files and saved model will be kept.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Clear copies") { _, _ -> chat.clearImportedFiles() }.show()
+        }.apply { isEnabled = !state.busy }, fullWidth(top = 8))
         dialog.setContentView(ScrollView(this).apply { addView(panel) })
         dialog.window?.apply {
             setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT)); addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
@@ -666,6 +761,77 @@ class MainActivity : ComponentActivity() {
             setTextIsSelectable(true); setLineSpacing(dp(4).toFloat(), 1f); setPadding(dp(21), dp(12), dp(21), dp(18))
         }
         AlertDialog.Builder(this).setTitle(title).setView(ScrollView(this).apply { addView(body) }).setPositiveButton("Close", null).show()
+    }
+
+    private fun copyAnswer(message: PocketChatMessage) {
+        val tables = MarkdownDocument.parse(message.text).filterIsInstance<MarkdownBlock.Table>()
+        fun copyFormatted() {
+            val html = runCatching { AnswerExports.html(message.text) }.getOrNull()
+            copyToClipboard(AnswerExports.plainText(message.text), html)
+        }
+        if (tables.isEmpty()) { copyFormatted(); return }
+        val choices = listOf("Copy formatted answer", "Copy Markdown") + tables.indices.map {
+            if (tables.size == 1) "Copy table for spreadsheet" else "Copy table ${it + 1} for spreadsheet"
+        }
+        AlertDialog.Builder(this).setTitle("Copy output").setItems(choices.toTypedArray()) { _, index ->
+            when (index) {
+                0 -> copyFormatted()
+                1 -> copyToClipboard(message.text)
+                else -> copyToClipboard(AnswerExports.tableTsv(tables[index - 2]))
+            }
+        }.show()
+    }
+
+    private fun copyToClipboard(plain: String, html: String? = null) {
+        val maximumBytes = 200_000
+        if (plain.length > maximumBytes || plain.toByteArray(Charsets.UTF_8).size > maximumBytes) {
+            chat.reportError("This answer is too large for the clipboard. Use Download to save the full output.")
+            return
+        }
+        try {
+            val includeHtml = html != null && html.length <= maximumBytes &&
+                plain.toByteArray(Charsets.UTF_8).size + html.toByteArray(Charsets.UTF_8).size <= maximumBytes
+            val clip = if (includeHtml) ClipData.newHtmlText("Pocket Agent answer", plain, html!!)
+                else ClipData.newPlainText("Pocket Agent answer", plain)
+            clip.description.extras = PersistableBundle().apply {
+                putBoolean(if (Build.VERSION.SDK_INT >= 33) ClipDescription.EXTRA_IS_SENSITIVE
+                    else "android.content.extra.IS_SENSITIVE", true)
+            }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
+        } catch (_: Exception) {
+            chat.reportError("The full answer could not be copied. Use Download to save it instead.")
+        }
+    }
+
+    private fun chooseExport(message: PocketChatMessage, share: Boolean) {
+        val options = AnswerExports.options(message.text, "pocket-agent-answer-${message.id}")
+        AlertDialog.Builder(this).setTitle(if (share) "Share answer as" else "Download answer as")
+            .setItems(options.map { it.label }.toTypedArray()) { _, index ->
+                lifecycleScope.launch {
+                    try {
+                        val export = chat.stageExport(options[index])
+                        if (share) {
+                            val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.files", chat.exportFile(export))
+                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                type = export.mimeType
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                clipData = ClipData.newUri(contentResolver, "Pocket Agent answer", uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(intent, "Share answer"))
+                        } else {
+                            chat.discardExport(chat.pendingDownload)
+                            chat.pendingDownload = export
+                            createAnswerDocument.launch(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                addCategory(Intent.CATEGORY_OPENABLE)
+                                type = export.mimeType
+                                putExtra(Intent.EXTRA_TITLE, export.fileName)
+                            })
+                        }
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (error: Exception) { chat.reportError(error.message ?: "This answer could not be exported.") }
+                }
+            }.show()
     }
 
     private fun chooseDocuments() {
@@ -742,6 +908,11 @@ class MainActivity : ComponentActivity() {
         super.onSaveInstanceState(outState)
         outState.putString("cameraUri", cameraUri?.toString()); outState.putString("draft", questionInput.text.toString())
         outState.putString("cameraFile", cameraFile?.name)
+        chat.pendingDownload?.let {
+            outState.putString("exportCacheName", it.cacheName)
+            outState.putString("exportFileName", it.fileName)
+            outState.putString("exportMime", it.mimeType)
+        }
     }
     override fun onDestroy() {
         modelDialog?.dismiss(); super.onDestroy()

@@ -42,6 +42,9 @@ class OfficeParserTest {
         assertEquals("body table 1 row 2", result.sections[2].locator)
         assertEquals("header1 paragraph 1", result.sections.last().locator)
         assertTrue(result.warnings.any { it.contains("page layout") })
+        assertTrue(result.extractionComplete)
+        assertNull(result.totalPages)
+        assertNull(result.processedPages)
     }
 
     @Test fun `reads spreadsheet values and rich shared strings with source cell references`() {
@@ -75,6 +78,7 @@ class OfficeParserTest {
         val result = OfficeParser(ExtractionLimits(maxCells = 2)).parseXlsx(file, "Budget.xlsx")
         assertEquals(2, result.sections.size)
         assertTrue(result.warnings.any { it.contains("2-cell limit") })
+        assertFalse(result.extractionComplete)
     }
 
     @Test fun `numeric metadata excludes text bool dates and invalid exponent values`() {
@@ -112,6 +116,7 @@ class OfficeParserTest {
         val result = OfficeParser(ExtractionLimits(maxTextChars = 5)).parseDocx(file, "Short.docx")
         assertEquals("Long ", result.sections.single().text)
         assertTrue(result.warnings.any { it.contains("5-character limit") })
+        assertFalse(result.extractionComplete)
     }
 
     @Test fun `rejects oversized decompressed components`() {
@@ -137,6 +142,7 @@ class OfficeParserTest {
         val result = OfficeParser().parseXlsx(file, "External.xlsx")
         assertTrue(result.sections.isEmpty())
         assertTrue(result.warnings.any { it.contains("could not be read") })
+        assertFalse(result.extractionComplete)
     }
 
     @Test fun `reads absolute package worksheet targets`() {
@@ -248,6 +254,49 @@ class OfficeParserTest {
         assertRejected("duplicate cell addresses") { OfficeParser().parseXlsx(duplicate, "duplicate.xlsx") }
         val edge = workbook("""<row r="1048576"><c r="xfd1048576"><v>7</v></c></row>""")
         assertEquals("'Finance & Ops'!XFD1048576", OfficeParser().parseXlsx(edge, "edge.xlsx").sections.single().locator)
+    }
+
+    @Test fun `Word footnotes endnotes and comments join the complete text extraction without invented pages`() {
+        val parts = mutableMapOf("word/document.xml" to wordText("Main body"))
+        for (part in listOf("footnotes", "endnotes", "comments")) {
+            parts["word/$part.xml"] = wordText("Text from $part")
+        }
+        val result = OfficeParser().parseDocx(archive("notes.docx", parts), "notes.docx")
+        assertEquals(listOf("Main body", "Text from footnotes", "Text from endnotes", "Text from comments"), result.sections.map { it.text })
+        assertEquals("footnotes paragraph 1", result.sections[1].locator)
+        assertTrue(result.extractionComplete)
+        assertNull(result.totalPages)
+        assertNull(result.processedPages)
+    }
+
+    @Test fun `Word header part cutoff is recorded as incomplete coverage`() {
+        val parts = mutableMapOf("word/document.xml" to wordText("Main"))
+        for (index in 1..41) parts["word/header$index.xml"] = wordText("Header $index")
+        val result = OfficeParser().parseDocx(archive("headers.docx", parts), "headers.docx")
+        assertEquals(41, result.sections.size)
+        assertFalse(result.extractionComplete)
+        assertTrue(result.warnings.any { it.contains("first 40 Word header") })
+    }
+
+    @Test fun `worksheet cutoff and unavailable shared strings prevent a complete extraction claim`() {
+        val workbookMetadata = workbookXml().replace("</sheets>", """<sheet name="Extra" sheetId="2" r:id="rId1"/></sheets>""")
+        val file = archive("sheets.xlsx", mapOf(
+            "xl/workbook.xml" to workbookMetadata,
+            "xl/_rels/workbook.xml.rels" to """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>""",
+            "xl/worksheets/sheet1.xml" to """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>""",
+        ))
+        val result = OfficeParser(ExtractionLimits(maxSheets = 1)).parseXlsx(file, "sheets.xlsx")
+        assertFalse(result.extractionComplete)
+        assertTrue(result.warnings.any { it.contains("first 1 worksheets") })
+        val missingString = workbook("""<row r="1"><c r="A1" t="s"><v>9999</v></c></row>""")
+        assertFalse(OfficeParser().parseXlsx(missingString, "string.xlsx").extractionComplete)
+    }
+
+    @Test fun `known unsupported Word text boxes prevent a full coverage claim`() {
+        val xml = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Main</w:t></w:r><w:txbxContent><w:p><w:r><w:t>Boxed</w:t></w:r></w:p></w:txbxContent></w:p></w:body></w:document>"""
+        val result = OfficeParser().parseDocx(archive("boxes.docx", mapOf("word/document.xml" to xml)), "boxes.docx")
+        assertFalse(result.extractionComplete)
+        assertTrue(result.warnings.any { it.contains("text boxes") })
     }
 
     private fun assertRejected(message: String, block: () -> Unit) {

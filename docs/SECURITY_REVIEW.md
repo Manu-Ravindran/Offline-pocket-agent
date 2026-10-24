@@ -1,4 +1,4 @@
-# Pocket Agent security review — 0.2
+# Pocket Agent security review — 0.3
 
 Scope: Android source, file-import paths, local agent execution, model loading, manifest, and GitHub build/signing workflow. The review includes regression tests and packaged-manifest checks. A physical-device penetration test and a complete audit of third-party native libraries have not been performed.
 
@@ -18,13 +18,18 @@ Scope: Android source, file-import paths, local agent execution, model loading, 
 | Build/update | Initial APK was debuggable and had an ephemeral signing key | Preview/release debugging disabled; persistent release signing supported using an encrypted key and a GitHub secret; parallel preview protects the old installation |
 | Supply chain | Mutable action tags could select different code over time | Action commit pins, fixed AAR version and checksum, limited workflow permissions and no signing secrets in PR builds |
 | Distribution/manifest checks | PR artifacts could be mistaken for official downloads; SDK-specific permission declarations could evade a narrow check | APK artifacts are published only from trusted main runs; both permission declaration forms are checked; the unneeded exported profile-install receiver is removed |
+| Conversation scope | Empty selections could fall back to every stored import | New chats start with empty attachment/history scope; explicit empty selections mean no files; session epochs reject stale completions and imports |
+| Native handle lifetime | Stop and destruction could race during model replacement/close | Short lifetime locks serialize stop, publication, and destruction for text/vision handles while generation remains interruptible |
+| Vision readiness | A wrapper could exist after projector activation failed | A pinned JNI adapter queries the actual native vision capability; image failures identify their stage and do not masquerade as visual analysis |
+| Export destination | A malicious document-picker result could return a file URI and exploit the app's own write privileges | Save accepts external content-provider URIs only and rejects the app's own FileProvider, including user-qualified authorities |
+| Rich output | Ragged tables could amplify into a large padded grid or Binder clipboard payload | Bounded native formatting, no artificial export grid padding, raw-content fallback, clipboard byte checks/error handling, HTML escaping/CSP, and CSV/TSV formula neutralization |
 
 These findings establish concrete resource and trust-boundary gaps. No demonstrated XXE exfiltration or verified current GenieX memory-corruption vulnerability was established during this review.
 
 ## Boundaries kept narrow
 
 - The APK has no Internet or broad-storage permission. CI inspects the merged manifest, including library contributions.
-- Only the launcher activity is intentionally exported. The FileProvider and isolated PDF service are private; camera sharing exposes only a dedicated cache directory.
+- Only the launcher activity is intentionally exported. The FileProvider and isolated PDF service are private; explicit sharing exposes only dedicated camera or generated-export cache files through temporary grants.
 - Documents and model metadata never become shell commands or executable code. Agent actions cannot execute scripts, browse the network, or modify original documents.
 - Untrusted names are display labels, not filesystem paths. Imported files receive private generated directories.
 - Native model loading accepts the exact reviewed artifact pair. Verification proofs live in private preferences and are not imported from model sidecars or documents.

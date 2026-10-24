@@ -47,6 +47,8 @@ class PdfSandboxClient(context: Context) {
                     require(count >= 0) { "The PDF renderer returned an invalid page count." }
                     val warnings = mutableListOf<String>()
                     val sections = mutableListOf<DocumentSection>()
+                    var complete = count <= limits.maxPages
+                    var processedPages = 0
                     if (count > limits.maxPages) warnings += "Only the first ${limits.maxPages} of $count PDF pages were read."
                     var usedChars = 0
                     var usedOcr = false
@@ -54,6 +56,7 @@ class PdfSandboxClient(context: Context) {
                         coroutineContext.ensureActive()
                         val remaining = limits.maxTextChars - usedChars
                         if (remaining <= 0) {
+                            complete = false
                             warnings += "Text extraction stopped at the ${limits.maxTextChars}-character limit; the PDF may have additional content."
                             break
                         }
@@ -106,21 +109,38 @@ class PdfSandboxClient(context: Context) {
                                 kind = "pdf_ocr"
                                 usedOcr = true
                             }
-                            if (metadata[2] == 1) warnings += "Text on PDF page ${index + 1} exceeded the per-page extraction limit."
-                            if (pageText.isBlank()) warnings += "No readable text was found on PDF page ${index + 1}."
+                            if (metadata[2] == 1) {
+                                complete = false
+                                warnings += "Text on PDF page ${index + 1} exceeded the per-page extraction limit."
+                            }
+                            if (pageText.isBlank()) {
+                                complete = false
+                                warnings += "No readable text was found on PDF page ${index + 1}; it may be blank or unreadable."
+                            }
                             else {
                                 val kept = pageText.trim().take(remaining)
                                 sections += DocumentSection("page ${index + 1}", kept, kind)
                                 usedChars += kept.length
-                                if (pageText.length > remaining) warnings += "Text extraction stopped at the ${limits.maxTextChars}-character limit; the PDF may have additional content."
+                                if (pageText.length > remaining) {
+                                    complete = false
+                                    warnings += "Text extraction stopped at the ${limits.maxTextChars}-character limit; the PDF may have additional content."
+                                }
                             }
+                            processedPages += 1
                         } finally {
                             runCatching { pixels.close() }
                         }
                     }
                     if (usedOcr) warnings += "Some PDF text was recognized from page images. Check OCR text against the original before relying on names or numbers."
                     warnings += "PDF extraction reads text; diagrams, charts, and image-only meaning require a vision model."
-                    ExtractedDocument(displayName, "pdf", sections, warnings.distinct())
+                    if (usedChars >= limits.maxTextChars) {
+                        complete = false
+                        if (warnings.none { it.startsWith("Text extraction stopped") }) {
+                            warnings += "Text extraction reached the ${limits.maxTextChars}-character limit; verify coverage before relying on a full summary."
+                        }
+                    }
+                    ExtractedDocument(displayName, "pdf", sections, warnings.distinct(),
+                        totalPages = count, processedPages = processedPages, extractionComplete = complete && processedPages == count)
                 } catch (error: RemoteException) {
                     throw IllegalArgumentException("The isolated PDF reader stopped. This file may be damaged or too complex to read safely.", error)
                 } catch (error: SecurityException) {

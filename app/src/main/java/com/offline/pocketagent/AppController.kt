@@ -15,6 +15,8 @@ import com.offline.pocketagent.inference.ChatMessage
 import com.offline.pocketagent.inference.LocalInference
 import com.offline.pocketagent.security.TrustedModelPolicy
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -34,13 +36,16 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
     private val preferences = app.getSharedPreferences("pocket_agent", Context.MODE_PRIVATE)
     private val inference = LocalInference(app)
     private val mutex = Mutex()
-    private val conversation = mutableListOf<ConversationTurn>()
+    private val session = ConversationSession()
     @Volatile private var activeOperation: Job? = null
+    @Volatile private var modelContextNeedsReset = false
+    private var lastRequestDocumentIds: Set<String>? = null
 
     suspend fun importDocument(uri: Uri): ImportedDocument = mutex.withLock {
         withActiveOperation {
+            val importScope = session.snapshot(emptyList())
             require((documentsRoot.listFiles()?.count { File(it, "document.json").isFile } ?: 0) < MAX_DOCUMENTS) {
-                "This first version stores up to $MAX_DOCUMENTS documents. Clear app storage to start a new library."
+                "Private import storage holds at most $MAX_DOCUMENTS files. Use Settings → Clear imported files to free it; your originals and saved model will stay."
             }
             val name = displayName(uri)
             onStatus("Importing $name…")
@@ -52,6 +57,9 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                 val extracted = DocumentExtractor(context = app).extract(copy, name, app.contentResolver.getType(uri))
                 val entry = LibraryDocument(id, extracted)
                 writeDocument(File(directory, "document.json"), entry)
+                if (!session.attachIfCurrent(id, importScope.generation)) {
+                    throw CancellationException("The conversation changed while this file was being imported.")
+                }
                 entry.toImported()
             } catch (error: Exception) {
                 directory.deleteRecursively()
@@ -61,12 +69,13 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
     }
 
     suspend fun listDocuments(): List<ImportedDocument> = mutex.withLock {
-        withActiveOperation { readLibrary().map { it.toImported() } }
+        withActiveOperation { readLibrary(session.documentIds()).map { it.toImported() } }
     }
 
     suspend fun previewDocument(id: String): String = mutex.withLock {
         withActiveOperation {
-            val entry = requireNotNull(readLibrary().firstOrNull { it.id == id }) {
+            session.snapshot(listOf(id))
+            val entry = requireNotNull(readLibrary(listOf(id)).firstOrNull { it.id == id }) {
                 "This document could not be reopened. Import it again."
             }
             buildString {
@@ -105,11 +114,13 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                 }
                 onStatus("Loading the model on this phone…")
                 inference.loadModel(model, projector)
+                modelContextNeedsReset = false
+                lastRequestDocumentIds = null
                 preferences.edit().putString("model_path", model.absolutePath)
                     .putString("model_name", name)
                     .putString("projector_path", projector?.absolutePath).apply()
                 modelsRoot.listFiles()?.filter { it != directory }?.forEach { it.deleteRecursively() }
-                "Loaded $name${if (inference.isVisionEnabled) " · vision enabled" else " · text and OCR"}"
+                "Loaded $name${visionSummary()}"
             } catch (error: Exception) {
                 directory.deleteRecursively()
                 throw error
@@ -127,6 +138,8 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                     val projector = preferences.getString("projector_path", null)?.let(::File)?.takeIf { it.isFile }
                     onStatus("Loading your saved local model…")
                     inference.loadModel(model, projector)
+                    modelContextNeedsReset = false
+                    lastRequestDocumentIds = null
                     onStatus("Ready. ${modelSummary()}")
                     true
                 }
@@ -142,19 +155,26 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
         withActiveOperation {
             require(question.isNotBlank()) { "Enter a question first." }
             require(question.length <= 2_000) { "Please keep your question under 2,000 characters." }
+            val scope = session.snapshot(documentIds)
+            val library = readLibrary(scope.documentIds)
+            require(library.size == scope.documentIds.size) {
+                "An attachment could not be reopened. Start a new conversation, then add that file again."
+            }
             if (!inference.isLoaded) {
                 val model = preferences.getString("model_path", null)?.let(::File)
                 require(model?.isFile == true) { "Choose and load a local GGUF model first. Document import and OCR already work without one." }
                 val projector = preferences.getString("projector_path", null)?.let(::File)?.takeIf { it.isFile }
                 onStatus("Loading your saved local model…")
                 inference.loadModel(model, projector)
+                modelContextNeedsReset = false
+                lastRequestDocumentIds = null
             }
-            val library = readLibrary().let { all ->
-                if (documentIds.isNullOrEmpty()) all else {
-                    require(documentIds.all { id -> all.any { it.id == id } }) { "An attached document could not be reopened. Import it again." }
-                    all.filter { it.id in documentIds }
-                }
+            val requestIds = scope.documentIds.toSet()
+            if (modelContextNeedsReset || (lastRequestDocumentIds != null && lastRequestDocumentIds != requestIds)) {
+                inference.resetConversationContext()
+                modelContextNeedsReset = false
             }
+            lastRequestDocumentIds = requestIds
             val engine = AgentEngine(
                 generate = { prompt, image ->
                     runInference(prompt, image, maxTokens = 256)
@@ -164,9 +184,12 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                     runInference(prompt, image, maximum, onDelta)
                 },
             )
-            val result = engine.respond(question.trim(), library, inference.isVisionEnabled, onPartial, conversation.takeLast(6))
-            conversation += ConversationTurn(question.take(1_000), result.text.take(2_000))
-            while (conversation.size > 6) conversation.removeAt(0)
+            val scopedPartial: (String) -> Unit = { text -> if (session.isCurrent(scope)) onPartial(text) }
+            val result = engine.respond(question.trim(), library, inference.isVisionEnabled, scopedPartial, scope.history,
+                visionUnavailableReason = inference.visionUnavailableReason)
+            if (!session.remember(scope, question, result.text)) {
+                throw CancellationException("The conversation changed while the response was being generated.")
+            }
             result
         }
     }
@@ -174,7 +197,7 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
     fun modelSummary(): String {
         val name = preferences.getString("model_name", null)
         return when {
-            inference.isLoaded -> "${name ?: "Local model"} is loaded${if (inference.isVisionEnabled) " with vision" else " for text and OCR"}."
+            inference.isLoaded -> "${name ?: "Local model"} is ready${visionSummary()}."
             name != null && hasSavedModel() -> "$name is saved and loads automatically when the app opens."
             else -> "No model loaded. Choose a GGUF model to enable answers."
         }
@@ -186,7 +209,35 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
 
     fun clearConversation() {
         check(activeOperation == null) { "Wait for the current operation to finish before starting a new conversation." }
-        conversation.clear()
+        session.clear()
+        modelContextNeedsReset = inference.isLoaded
+    }
+
+    fun newConversation() = clearConversation()
+
+    /** Explicitly clears only generated private document copies; source files and model storage are untouched. */
+    suspend fun clearImportedDocuments(): Int = mutex.withLock {
+        withActiveOperation {
+            session.clear()
+            modelContextNeedsReset = inference.isLoaded
+            val root = documentsRoot.canonicalFile
+            var removed = 0
+            val failures = mutableListOf<String>()
+            for (directory in documentsRoot.listFiles().orEmpty()) {
+                if (!directory.name.matches(Regex("[0-9a-f]{8}")) || !directory.isDirectory ||
+                    Files.isSymbolicLink(directory.toPath()) || directory.canonicalFile.parentFile != root) continue
+                if (directory.deleteRecursively()) removed++ else failures += directory.name
+            }
+            check(failures.isEmpty()) { "Some private imported copies could not be cleared. Close the app and try again; your saved model was not changed." }
+            onStatus("Cleared $removed private imported files. Your originals and model are unchanged.")
+            removed
+        }
+    }
+
+    private fun visionSummary(): String = when {
+        inference.isVisionEnabled -> " · vision enabled"
+        inference.visionUnavailableReason != null -> " · text ready; vision unavailable: ${inference.visionUnavailableReason}"
+        else -> " · text and OCR"
     }
 
     fun close() {
@@ -294,13 +345,15 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
         if (cursor.moveToFirst()) cursor.getString(0) else null
     }?.take(200)?.ifBlank { null } ?: "Imported file"
 
-    private fun readLibrary(): List<LibraryDocument> = documentsRoot.listFiles().orEmpty()
-        .filter { File(it, "document.json").isFile }.sortedBy { it.lastModified() }.take(MAX_DOCUMENTS)
-        .mapNotNull { directory ->
+    /** Read only the IDs explicitly scoped to this conversation, never the full private archive. */
+    private fun readLibrary(documentIds: List<String>): List<LibraryDocument> = documentIds.distinct().take(MAX_DOCUMENTS)
+        .mapNotNull { id ->
+            val directory = File(documentsRoot, id)
             runCatching {
                 val metadata = File(directory, "document.json")
                 require(metadata.length() <= MAX_METADATA_BYTES)
                 val data = JSONObject(metadata.readText())
+                require(data.getString("id") == id) { "The document index does not match its attachment." }
                 val sections = data.getJSONArray("sections")
                 val warnings = data.getJSONArray("warnings")
                 LibraryDocument(data.getString("id"), ExtractedDocument(
@@ -315,6 +368,9 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                     },
                     warnings = (0 until warnings.length()).map { warnings.getString(it) },
                     imagePath = if (data.optBoolean("hasImage")) File(directory, "original").absolutePath else null,
+                    totalPages = if (data.has("totalPages") && !data.isNull("totalPages")) data.getInt("totalPages") else null,
+                    processedPages = if (data.has("processedPages") && !data.isNull("processedPages")) data.getInt("processedPages") else null,
+                    extractionComplete = data.optBoolean("extractionComplete", false),
                 ))
             }.getOrElse {
                 onStatus("A saved document could not be reopened. Import that document again.")
@@ -331,9 +387,23 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
         val data = JSONObject().put("id", entry.id).put("name", document.name).put("kind", document.kind)
             .put("sections", sections).put("warnings", JSONArray(document.warnings))
             .put("hasImage", document.imagePath != null)
+            .put("totalPages", document.totalPages ?: JSONObject.NULL)
+            .put("processedPages", document.processedPages ?: JSONObject.NULL)
+            .put("extractionComplete", document.extractionComplete)
+        val serialized = data.toString().toByteArray(Charsets.UTF_8)
+        require(serialized.size <= MAX_METADATA_BYTES) {
+            "This file produces an index larger than this version can store. Split the document into smaller files and import them separately."
+        }
         val pending = File(destination.parentFile, destination.name + ".part")
-        pending.writeText(data.toString())
-        check(pending.renameTo(destination)) { "The document index could not be saved." }
+        try {
+            FileOutputStream(pending).use { output ->
+                output.write(serialized)
+                output.fd.sync()
+            }
+            check(pending.renameTo(destination)) { "The document index could not be saved." }
+        } finally {
+            pending.delete()
+        }
     }
 
     private fun LibraryDocument.toImported(): ImportedDocument = ImportedDocument(

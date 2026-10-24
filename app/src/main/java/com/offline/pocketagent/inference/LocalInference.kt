@@ -3,10 +3,11 @@ package com.offline.pocketagent.inference
 import android.content.Context
 import com.geniex.sdk.GenieXSdk
 import com.geniex.sdk.LlmWrapper
-import com.geniex.sdk.VlmWrapper
 import com.geniex.sdk.bean.ComputeUnitValue
 import com.geniex.sdk.bean.GenerationConfig
+import com.geniex.sdk.bean.LLMTokenCallback
 import com.geniex.sdk.bean.LlmCreateInput
+import com.geniex.sdk.bean.LlmGenerateResult
 import com.geniex.sdk.bean.LlmStreamResult
 import com.geniex.sdk.bean.ModelConfig
 import com.geniex.sdk.bean.SamplerConfig
@@ -16,6 +17,7 @@ import com.geniex.sdk.bean.VlmCreateInput
 import com.offline.pocketagent.security.TrustedModelPolicy
 import java.io.Closeable
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,10 +27,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
@@ -47,17 +52,28 @@ data class ChatMessage(val role: String, val content: String)
 class LocalInference(context: Context) : Closeable {
     private val appContext = context.applicationContext
     private val mutex = Mutex()
+    // The outer mutex protects long operations. This short lifetime guard only
+    // serializes publication, native stop, and destruction. Never wait for the
+    // outer mutex while holding this guard: stop must remain callable mid-generate.
+    private val nativeLifetimeMutex = Mutex()
     private val nativeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var llm: LlmWrapper? = null
-    @Volatile private var vlm: VlmWrapper? = null
+    @Volatile private var vlm: NativeVisionSession? = null
+    private var loadedAttempt: Any? = null
     @Volatile private var closed = false
 
     val isLoaded: Boolean get() = !closed && (llm != null || vlm != null)
-    val isVisionEnabled: Boolean get() = !closed && vlm != null
+    val isVisionEnabled: Boolean get() = !closed && vlm?.supportsVision == true
+    val visionUnavailableReason: String? get() = if (!closed && vlm?.supportsVision == false) {
+        "The text model is ready, but GenieX could not activate its vision projector. " +
+            "Image analysis is unavailable; check the model setup and retry loading."
+    } else null
 
-    suspend fun loadModel(modelFile: File, projectorFile: File? = null) =
-        withContext(Dispatchers.IO) {
-            mutex.withLock {
+    suspend fun loadModel(modelFile: File, projectorFile: File? = null) {
+        val attempt = Any()
+        try {
+            withContext(Dispatchers.IO) {
+              mutex.withLock {
                 check(!closed) { "The inference session is closed." }
                 requireGguf(modelFile, "Model")
                 projectorFile?.let { requireGguf(it, "Vision projector") }
@@ -69,7 +85,10 @@ class LocalInference(context: Context) : Closeable {
                 val trust = TrustedModelPolicy(appContext)
                 trust.verify(modelFile, TrustedModelPolicy.Role.MODEL)
                 projectorFile?.let { trust.verify(it, TrustedModelPolicy.Role.PROJECTOR) }
+                currentCoroutineContext().ensureActive()
+                check(!closed) { "The inference session is closed." }
                 destroyModels()
+                loadedAttempt = attempt
                 initializeSdk()
                 val config = ModelConfig(
                     nCtx = 8192,
@@ -81,29 +100,74 @@ class LocalInference(context: Context) : Closeable {
                     nUBatch = 128,
                     nGpuLayers = 0,
                 )
-                if (projectorFile == null) {
-                    llm = LlmWrapper.builder().llmCreateInput(
-                        LlmCreateInput(
-                            model_path = canonicalModel.path,
-                            config = config,
-                            runtime_id = GenieXSdk.PLUGIN_ID_LLAMA_CPP,
-                            compute_unit = ComputeUnitValue.CPU.value,
-                        ),
-                    ).build().getOrThrow()
-                } else {
-                    vlm = VlmWrapper.builder().vlmCreateInput(
-                        VlmCreateInput(
-                            model_path = canonicalModel.path,
-                            mmproj_path = canonicalProjector?.path,
-                            config = config,
-                            runtime_id = GenieXSdk.PLUGIN_ID_LLAMA_CPP,
-                            compute_unit = ComputeUnitValue.CPU.value,
-                            vit_device_id = "CPU",
-                        ),
-                    ).build().getOrThrow()
+                // SDK builders create a native handle before a dispatcher return can
+                // deliver cancellation. Publish ownership while non-cancellable so
+                // the outer cleanup can always release that handle before import
+                // failure cleanup removes the model directory.
+                withContext(NonCancellable) {
+                    if (projectorFile == null) {
+                        val created = inferenceStage("Text model initialization") {
+                            LlmWrapper.builder().llmCreateInput(
+                                LlmCreateInput(
+                                    model_path = canonicalModel.path,
+                                    config = config,
+                                    runtime_id = GenieXSdk.PLUGIN_ID_LLAMA_CPP,
+                                    compute_unit = ComputeUnitValue.CPU.value,
+                                ),
+                            ).build().getOrThrow()
+                        }
+                        nativeLifetimeMutex.withLock { llm = created }
+                        inferenceStage("Text chat template initialization") {
+                            checkNotNull(llm).applyChatTemplate(
+                                arrayOf(SdkChatMessage("user", "Hello")), null, false, true,
+                            ).getOrThrow()
+                        }
+                    } else {
+                        val created = inferenceStage("Multimodal model initialization") {
+                            NativeVisionSession(
+                                VlmCreateInput(
+                                    model_path = canonicalModel.path,
+                                    mmproj_path = canonicalProjector?.path,
+                                    config = config,
+                                    runtime_id = GenieXSdk.PLUGIN_ID_LLAMA_CPP,
+                                    compute_unit = ComputeUnitValue.CPU.value,
+                                    vit_device_id = "CPU",
+                                ),
+                            )
+                        }
+                        nativeLifetimeMutex.withLock { vlm = created }
+                        inferenceStage("Multimodal chat template initialization") {
+                            checkNotNull(vlm).applyChatTemplate(arrayOf(
+                                VlmChatMessage("user", listOf(VlmContent("text", "Hello"))),
+                            )).formattedText.also { check(it.isNotBlank()) { "The model chat template was empty." } }
+                        }
+                    }
+                }
+                check(!closed) { "The inference session was closed while loading." }
+              }
+            }
+        } catch (error: Throwable) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                mutex.withLock {
+                    if (loadedAttempt === attempt) destroyModels()
                 }
             }
+            throw error
         }
+    }
+
+    /** Clears old conversation state without unloading the verified model weights. */
+    suspend fun resetConversationContext() = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            check(!closed) { "The inference session is closed." }
+            llm?.let { text -> inferenceStage("Text conversation reset") {
+                check(text.reset() == 0) { "The runtime could not clear the old text context." }
+            } }
+            vlm?.let { vision -> inferenceStage("Multimodal conversation reset") {
+                check(vision.reset() == 0) { "The runtime could not clear the old image context." }
+            } }
+        }
+    }
 
     /**
      * [onToken] receives decoded text deltas on an IO worker. The SDK buffers
@@ -126,7 +190,9 @@ class LocalInference(context: Context) : Closeable {
                 }
                 imageFile?.let {
                     require(it.isFile && it.canRead()) { "The attached image is unavailable." }
-                    check(vlm != null) { "Load a matching vision model and projector to analyze images." }
+                    check(isVisionEnabled) {
+                        visionUnavailableReason ?: "Load the model with its matching vision projector to analyze images."
+                    }
                 }
                 // The external scope lets cancellation call stopStream while native generate
                 // occupies a worker thread. Await termination before releasing the model lock.
@@ -140,9 +206,10 @@ class LocalInference(context: Context) : Closeable {
                     generation.await()
                 } catch (cancelled: CancellationException) {
                     withContext(NonCancellable) {
-                        llm?.stopStream()
-                        vlm?.stopStream()
+                        requestStopStreams()
                         generation.cancelAndJoin()
+                        runCatching { llm?.reset() }
+                        runCatching { vlm?.reset() }
                     }
                     throw cancelled
                 }
@@ -164,7 +231,9 @@ class LocalInference(context: Context) : Closeable {
             // The VLM backend requires append-only history including its exact last
             // generation. Agent planner requests are independent prompts, so reset
             // this context while retaining the loaded model and vision encoder.
-            check(vision.reset() == 0) { "Could not reset the vision model." }
+            inferenceStage("Multimodal context reset") {
+                check(vision.reset() == 0) { "Could not reset the vision model." }
+            }
             val lastUser = messages.indexOfLast { it.role == "user" }
             require(imageFile == null || lastUser >= 0) { "An image needs a user message." }
             val formattedMessages = messages.mapIndexed { index, message ->
@@ -175,25 +244,69 @@ class LocalInference(context: Context) : Closeable {
                 contents += VlmContent("text", message.content)
                 VlmChatMessage(message.role, contents)
             }.toTypedArray()
-            val prompt = vision.applyChatTemplate(
-                messages = formattedMessages,
-                tools = null,
-                enableThinking = false,
-            )
-                .getOrThrow().formattedText
-            val mediaConfig = vision.injectMediaPathsToConfig(formattedMessages, config)
-            return collectOutput(vision.generateStreamFlow(prompt, mediaConfig), onToken)
+            val stage = if (imageFile == null) "Text" else "Image"
+            val prompt = inferenceStage("$stage chat template") {
+                vision.applyChatTemplate(formattedMessages).formattedText.also {
+                    check(it.isNotBlank()) { "The model chat template was empty." }
+                }
+            }
+            config.imagePaths = imageFile?.let { arrayOf(it.absolutePath) }
+            config.imageCount = if (imageFile == null) 0 else 1
+            return inferenceStage("$stage generation") {
+                collectOutput(visionStream(vision, prompt, config), onToken)
+            }
         }
         val text = checkNotNull(llm) { "No local model is loaded." }
         // The text backend safely reuses common token prefixes and rolls back the
         // differing suffix itself. Clearing it here would discard useful prefill.
-        val prompt = text.applyChatTemplate(
-            messages = messages.map { SdkChatMessage(it.role, it.content) }.toTypedArray(),
-            tools = null,
-            enableThinking = false,
-            addGenerationPrompt = true,
-        ).getOrThrow().formattedText
-        return collectOutput(text.generateStreamFlow(prompt = prompt, config = config), onToken)
+        val prompt = inferenceStage("Text chat template") {
+            text.applyChatTemplate(
+                messages = messages.map { SdkChatMessage(it.role, it.content) }.toTypedArray(),
+                tools = null,
+                enableThinking = false,
+                addGenerationPrompt = true,
+            ).getOrThrow().formattedText
+        }
+        return inferenceStage("Text generation") {
+            collectOutput(text.generateStreamFlow(prompt = prompt, config = config), onToken)
+        }
+    }
+
+    private fun visionStream(
+        vision: NativeVisionSession,
+        prompt: String,
+        config: GenerationConfig,
+    ): Flow<LlmStreamResult> = callbackFlow {
+        val completed = AtomicBoolean(false)
+        val callback = object : LLMTokenCallback {
+            override fun onToken(token: String): Boolean = isActive && trySend(LlmStreamResult.Token(token)).isSuccess
+            override fun onComplete(result: LlmGenerateResult) {
+                completed.set(true)
+                trySend(LlmStreamResult.Completed(result.profileData))
+                close()
+            }
+        }
+        try {
+            withContext(Dispatchers.IO) { vision.generate(prompt, config, callback) }
+            if (!completed.get()) {
+                trySend(LlmStreamResult.Error(IllegalStateException("The native runtime returned without completing generation.")))
+                close()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            trySend(LlmStreamResult.Error(error))
+            close()
+        }
+        awaitClose { }
+    }
+
+    private suspend fun <T> inferenceStage(label: String, action: suspend () -> T): T = try {
+        action()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        throw IllegalStateException("$label failed: ${error.message?.take(300) ?: error.javaClass.simpleName}", error)
     }
 
     private suspend fun collectOutput(
@@ -242,21 +355,39 @@ class LocalInference(context: Context) : Closeable {
         }
     }
 
-    private fun destroyModels() {
-        llm?.close()
-        llm = null
-        vlm?.close()
-        vlm = null
+    private suspend fun requestStopStreams() {
+        nativeLifetimeMutex.withLock {
+            runCatching { llm?.stopStream() }
+            runCatching { vlm?.stopStream() }
+        }
+    }
+
+    private suspend fun destroyModels() {
+        nativeLifetimeMutex.withLock {
+            val text = llm
+            val vision = vlm
+            llm = null
+            vlm = null
+            loadedAttempt = null
+            try {
+                text?.close()
+            } finally {
+                vision?.close()
+            }
+        }
     }
 
     override fun close() {
         if (closed) return
         closed = true
         nativeScope.launch {
-            llm?.stopStream()
-            vlm?.stopStream()
-            mutex.withLock { destroyModels() }
-            nativeScope.cancel()
+            try {
+                requestStopStreams()
+                // The lifetime guard has been released before waiting here.
+                mutex.withLock { destroyModels() }
+            } finally {
+                nativeScope.cancel()
+            }
         }
     }
 }

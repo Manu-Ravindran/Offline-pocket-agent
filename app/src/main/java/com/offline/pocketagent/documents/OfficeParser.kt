@@ -29,6 +29,10 @@ data class ExtractedDocument(
     val sections: List<DocumentSection>,
     val warnings: List<String> = emptyList(),
     val imagePath: String? = null,
+    val totalPages: Int? = null,
+    val processedPages: Int? = null,
+    /** False for known cutoffs or unreadable content; true does not guarantee OCR accuracy. */
+    val extractionComplete: Boolean = true,
 )
 
 data class ExtractionLimits(
@@ -59,14 +63,21 @@ class OfficeParser(private val limits: ExtractionLimits = ExtractionLimits()) {
         require(zip.getEntry("word/document.xml") != null) { "This is not a readable .docx document." }
         val output = SectionCollector(limits.maxTextChars)
         readWordPart(zip, "word/document.xml", "body", output)
-        zip.entries().asSequence()
+        val headersAndFooters = zip.entries().asSequence()
             .map { it.name }
             .filter { it.matches(Regex("word/(header|footer)[0-9]+\\.xml")) }
             .sorted()
+            .toList()
+        if (headersAndFooters.size > 40) output.markIncomplete("Only the first 40 Word header and footer parts were read.")
+        headersAndFooters.asSequence()
             .take(40)
             .forEach { readWordPart(zip, it, it.substringAfterLast('/').substringBefore('.'), output) }
+        for (part in listOf("footnotes", "endnotes", "comments")) {
+            val path = "word/$part.xml"
+            if (zip.getEntry(path) != null) readWordPart(zip, path, part, output)
+        }
         output.warnings += "Extracted Word text and table contents; page layout, drawings, and embedded objects are not interpreted."
-        ExtractedDocument(displayName, "docx", output.sections, output.warnings.distinct())
+        ExtractedDocument(displayName, "docx", output.sections, output.warnings.distinct(), extractionComplete = output.extractionComplete)
     }
 
     fun parseXlsx(file: File, displayName: String): ExtractedDocument = withArchive(file) { zip ->
@@ -76,7 +87,7 @@ class OfficeParser(private val limits: ExtractionLimits = ExtractionLimits()) {
         val dateStyles = readDateStyles(zip)
         val sheets = readSheets(zip)
         if (sheets.size > limits.maxSheets) {
-            output.warnings += "Only the first ${limits.maxSheets} worksheets were read."
+            output.markIncomplete("Only the first ${limits.maxSheets} worksheets were read.")
         }
         var cellsRead = 0
         var formulasSeen = false
@@ -89,7 +100,7 @@ class OfficeParser(private val limits: ExtractionLimits = ExtractionLimits()) {
             }
             val path = relationships[relationshipId]
             if (path == null || zip.getEntry(path) == null) {
-                output.warnings += "Worksheet '$sheetName' could not be read."
+                output.markIncomplete("Worksheet '$sheetName' could not be read.")
                 continue
             }
             val parser = xml(zip, path)
@@ -123,8 +134,10 @@ class OfficeParser(private val limits: ExtractionLimits = ExtractionLimits()) {
                         }
                         cellsRead++
                         val value = when (cellType) {
-                            "s" -> rawValue.toIntOrNull()?.let { sharedStrings.getOrNull(it) }
-                                ?: "[unavailable shared string]"
+                            "s" -> rawValue.toIntOrNull()?.let { sharedStrings.getOrNull(it) } ?: run {
+                                output.markIncomplete("Some workbook text referenced an unavailable shared string.")
+                                "[unavailable shared string]"
+                            }
                             "inlineStr" -> inlineValue.toString()
                             "b" -> when (rawValue) { "1" -> "TRUE"; "0" -> "FALSE"; else -> rawValue }
                             else -> rawValue
@@ -144,12 +157,12 @@ class OfficeParser(private val limits: ExtractionLimits = ExtractionLimits()) {
                 parser.next()
             }
         }
-        if (limitReached) output.warnings += "Reading stopped at the ${limits.maxCells}-cell limit."
+        if (limitReached) output.markIncomplete("Reading stopped at the ${limits.maxCells}-cell limit.")
         if (formulasSeen) {
             output.warnings += "Formulas were not calculated. Cached values may be missing or out of date."
         }
         output.warnings += "Extracted worksheet cell data. Numeric values retain their stored form; Excel display formats, charts, and macros are not interpreted."
-        ExtractedDocument(displayName, "xlsx", output.sections, output.warnings.distinct())
+        ExtractedDocument(displayName, "xlsx", output.sections, output.warnings.distinct(), extractionComplete = output.extractionComplete)
     }
 
     private fun readWordPart(zip: OfficeArchive, path: String, part: String, output: SectionCollector) {
@@ -166,7 +179,12 @@ class OfficeParser(private val limits: ExtractionLimits = ExtractionLimits()) {
         while (parser.eventType != XmlPullParser.END_DOCUMENT && !output.full) {
             when (parser.eventType) {
                 XmlPullParser.START_TAG -> when (parser.name) {
-                    "tbl" -> { table++; row = 0; inTable = true }
+                    "tbl" -> {
+                        if (inTable) output.markIncomplete("Nested Word tables could not be fully reconstructed.")
+                        table++; row = 0; inTable = true
+                    }
+                    "txbxContent" -> output.markIncomplete("Word text boxes could not be fully reconstructed.")
+                    "altChunk" -> output.markIncomplete("An embedded Word content part could not be read.")
                     "tr" -> { row++; inRow = true; rowCells = mutableListOf() }
                     "tc" -> cellText = StringBuilder()
                     "p" -> { paragraph++; paragraphText = StringBuilder() }
@@ -544,6 +562,8 @@ internal class SectionCollector(private val maxChars: Int) {
     val sections = mutableListOf<DocumentSection>()
     val warnings = mutableListOf<String>()
     private var used = 0
+    var extractionComplete: Boolean = true
+        private set
     val full: Boolean get() = used >= maxChars
 
     fun add(locator: String, text: String, kind: String, numericValue: String? = null, isFormula: Boolean = false) {
@@ -561,8 +581,11 @@ internal class SectionCollector(private val maxChars: Int) {
     }
 
     private fun warnTruncated() {
-        if (warnings.none { it.startsWith("Text extraction stopped") }) {
-            warnings += "Text extraction stopped at the $maxChars-character limit; the document may have additional content."
-        }
+        markIncomplete("Text extraction stopped at the $maxChars-character limit; the document may have additional content.")
+    }
+
+    fun markIncomplete(message: String) {
+        extractionComplete = false
+        if (message !in warnings) warnings += message
     }
 }
