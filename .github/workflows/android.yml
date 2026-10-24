@@ -1,0 +1,66 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Install Android platform
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Fetch pinned on-device inference SDK
+        shell: bash
+        run: |
+          mkdir -p app/libs
+          curl --fail --location --retry 3 \
+            'https://github.com/qualcomm/GenieX/releases/download/v0.9.3/geniex-android-aar-v0.9.3.aar' \
+            --output app/libs/geniex-android-v0.9.3.aar
+          echo '224c81687ca1a24491a6a5c05000eb7af22821f0d1bca251ea6e0e4e9291a3cd  app/libs/geniex-android-v0.9.3.aar' | sha256sum --check
+      - name: Test, check, and build
+        run: gradle --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Check offline app permissions
+        shell: bash
+        run: |
+          apkanalyzer manifest permissions app/build/outputs/apk/debug/app-debug.apk > /tmp/pocket-agent-permissions.txt
+          if grep -Fx 'android.permission.INTERNET' /tmp/pocket-agent-permissions.txt; then
+            echo 'The app must not request Internet permission.'
+            exit 1
+          fi
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocket-agent-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload test and lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-check-reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results-debug.*
+          if-no-files-found: ignore
+          retention-days: 14
