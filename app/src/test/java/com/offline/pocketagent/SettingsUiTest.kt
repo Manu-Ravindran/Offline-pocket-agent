@@ -1,5 +1,6 @@
 package com.offline.pocketagent
 
+import android.app.Application
 import android.app.Dialog
 import android.content.ClipboardManager
 import android.content.Context
@@ -124,17 +125,24 @@ class SettingsUiTest {
     @Config(qualifiers = "w393dp-h852dp-port")
     fun selectedProjectorCanBeAppliedToAnAlreadySavedLanguageModel() {
         val activity = createActivity()
-        val application = activity.application
         val model = ViewModelProvider(activity)[PocketChatViewModel::class.java]
+        // AndroidViewModelFactory can retain an earlier Application in a Robolectric sandbox.
+        // Use the controller's owning Application, as the real configureModel operation does.
+        val application = model.getApplication<Application>()
         val directory = File(application.filesDir, "models/${UUID.randomUUID()}").apply { mkdirs() }
         val modelFile = File(directory, "model.gguf").apply { writeText("GGUF") }
         assertTrue("The saved-model fixture must exist in the running app's storage", modelFile.isFile)
-        assertTrue("The saved-model fixture preferences must be committed", application
-            .getSharedPreferences("pocket_agent", Context.MODE_PRIVATE).edit().clear()
+        val fixturePreferences = application.getSharedPreferences("pocket_agent", Context.MODE_PRIVATE)
+        assertTrue("The saved-model fixture preferences must be committed", fixturePreferences.edit().clear()
             .putString("model_path", modelFile.absolutePath)
             .putString("model_name", "Qwen3.5-4B-Q4_K_M.gguf").commit())
+        val fixtureDetails = "path=${fixturePreferences.getString("model_path", null)}, saved=${fixturePreferences.all}"
+        assertEquals("The fixture must be readable immediately after commit: $fixtureDetails",
+            modelFile.absolutePath, fixturePreferences.getString("model_path", null))
+        assertTrue("The running controller must find its saved model using getString: $fixtureDetails",
+            model.controller.hasSavedModel())
         val saved = model.controller.modelStatus()
-        assertTrue("The running controller must recognize the saved fixture: $saved", saved.modelImported)
+        assertTrue("The running controller must recognize the saved fixture: $saved; $fixtureDetails", saved.modelImported)
         assertFalse("This scenario must not already have a saved vision file: $saved", saved.projectorImported)
         model.stagedProjector = Uri.parse("content://test.documents/mmproj-F16.gguf")
         assertNull("The large language model must not need to be selected again", model.stagedModel)
@@ -218,6 +226,9 @@ class SettingsUiTest {
     private fun createActivity(): MainActivity {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup().visible()
         activityController = controller
+        // Clear the actual ViewModel app too: the factory may retain it across test methods.
+        ViewModelProvider(controller.get())[PocketChatViewModel::class.java].getApplication<Application>()
+            .getSharedPreferences("pocket_agent", Context.MODE_PRIVATE).edit().clear().commit()
         frames()
         return controller.get()
     }
