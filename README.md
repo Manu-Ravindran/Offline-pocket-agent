@@ -57,6 +57,16 @@ This security baseline accepts the following exact [Unsloth Qwen3.5-4B files](ht
 
 In Settings choose the model, optionally choose its matching vision file, and import. The app verifies SHA-256 before opening files with the native inference runtime. Custom GGUF files are rejected in this baseline. Existing saved models from an earlier installation are verified once when first loaded by the new code; private verification records avoid rereading gigabytes on every launch. Keep roughly 8 GB free for downloads and imported copies.
 
+Settings shows separate live states for the language model, the saved vision file, and image analysis. A selected filename alone does not mean that its model is loaded. If the language model is already saved, choose `mmproj-F16.gguf` and tap **Use saved model + selected vision file**; this imports only the vision file and reuses the saved language model. A saved model can be retried without selecting or copying it again. The settings sheet has a fixed visible header and a bounded scrollable body so its controls remain accessible on smaller screens and while the model is loading.
+
+## Collect diagnostic logs
+
+After reproducing an error, open **Settings → Diagnostics → Collect logs**. You can inspect the report, copy it, download a UTF-8 text file, or share it with an app you choose. Collection remains available during model loading, and **Clear logs** removes the private diagnostic history.
+
+The report contains app/Android/device compatibility information, model import/readiness flags, recent technical stages, sanitized exception types and stack frames, and available process-exit reason codes. Logs are bounded and private. Prompts, replies, document text, images, filenames, file paths, URIs, and raw exception messages are excluded. No device-wide log-reading permission or automatic upload is added. Errors that occurred before this logging feature was installed cannot be reconstructed from a new log; reproduce them once in the new version.
+
+For slow responses, the report separates waiting/preparation, time to the first reply, and total request time from individual model-generation passes. It records output character counts and average speed in characters per second, plus actual generated-token counts and rates when the runtime supplies them; streamed chunks are not counted as tokens. Document processing records format, extraction coverage, and duration without storing document contents. Memory, storage, battery, and thermal readings are current snapshots when the report is collected.
+
 The GGUF is one Qwen backbone for conversation and document work. Its matching vision file enables image input on that same backbone; a second language-model download is not required. Generic questions such as **“Analyze this”**, **“Summarize this”**, or **“Make a table from this”** use the attached image when it is the active context. The app queries the runtime's actual vision capability instead of assuming that a created wrapper means the projector loaded. A failed projector produces a visible warning while text conversation remains available.
 
 The runtime is pinned to [Qualcomm GenieX v0.9.3](https://github.com/qualcomm/GenieX/releases/tag/v0.9.3), and CI checks the AAR's SHA-256. CPU execution remains explicit; NPU/GPU acceleration is a later device benchmark rather than a claimed feature.

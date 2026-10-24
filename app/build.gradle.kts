@@ -10,8 +10,8 @@ android {
         applicationId = "com.offline.pocketagent"
         minSdk = 31
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.3.1"
         ndk { abiFilters += "arm64-v8a" }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -56,6 +56,7 @@ android {
         resources.pickFirsts += setOf("META-INF/LICENSE*", "META-INF/NOTICE*")
     }
     lint { abortOnError = true }
+    testOptions { unitTests.isIncludeAndroidResources = true }
 }
 
 dependencies {
@@ -69,6 +70,8 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("net.sf.kxml:kxml2:2.3.0")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.15.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
 }
 
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {

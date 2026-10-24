@@ -39,6 +39,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -48,6 +49,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
+import com.offline.pocketagent.diagnostics.AppDiagnostics
 import com.offline.pocketagent.output.AnswerExport
 import com.offline.pocketagent.output.AnswerExportCache
 import com.offline.pocketagent.output.AnswerExports
@@ -84,6 +86,7 @@ data class PocketChatState(
     val hasModel: Boolean = false,
     val modelReady: Boolean = false,
     val modelSummary: String = "No local model selected.",
+    val modelStatus: ModelStatus = ModelStatus(),
     val documents: List<ImportedDocument> = emptyList(),
     val messages: List<PocketChatMessage> = emptyList(),
     val error: String? = null,
@@ -162,6 +165,22 @@ class PocketChatViewModel(application: Application) : AndroidViewModel(applicati
         _status.value = "Loading your saved model…"
         val ready = controller.warmUpSavedModel()
         _state.update { it.copy(modelReady = ready) }
+    }
+
+    fun configureSelectedProjector() {
+        val projector = stagedProjector ?: return
+        startOperation("model") {
+            _status.value = "Importing the selected vision file…"
+            val result = controller.configureVisionProjector(projector)
+            stagedProjector = null
+            notice(result)
+        }
+    }
+
+    fun refreshModelStatus() {
+        val modelStatus = controller.modelStatus()
+        _state.update { it.copy(modelStatus = modelStatus, modelReady = modelStatus.modelLoaded,
+            hasModel = modelStatus.modelImported, modelSummary = controller.modelSummary()) }
     }
 
     fun send(question: String) {
@@ -272,8 +291,10 @@ class PocketChatViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private fun finishOperation() {
+        val modelStatus = controller.modelStatus()
         _state.update { it.copy(busy = false, operation = null,
-            hasModel = controller.hasSavedModel(), modelSummary = controller.modelSummary()) }
+            hasModel = modelStatus.modelImported, modelReady = modelStatus.modelLoaded,
+            modelStatus = modelStatus, modelSummary = controller.modelSummary()) }
         _status.value = "Ready"
         operationJob = null
     }
@@ -306,6 +327,10 @@ class MainActivity : ComponentActivity() {
     private var cameraUri: Uri? = null
     private var cameraFile: File? = null
     private var modelDialog: Dialog? = null
+    private var diagnosticsDialog: Dialog? = null
+    private var collectingLogs = false
+    private var modelSheet: ModelSheetViews? = null
+    private val selectedFileNames = mutableMapOf<String, String>()
     private var lastDocuments: List<ImportedDocument>? = null
     private var previousBusy = false
     private var latestStatus = "Starting…"
@@ -323,6 +348,14 @@ class MainActivity : ComponentActivity() {
         val sources: Button? = null, val details: Button? = null,
         val formatted: LinearLayout? = null,
         var displayed: PocketChatMessage? = null,
+    )
+
+    private data class ModelSheetViews(
+        val languageState: TextView, val languageDetail: TextView,
+        val projectorState: TextView, val projectorDetail: TextView,
+        val visionState: TextView, val visionDetail: TextView,
+        val operation: TextView, val actions: LinearLayout,
+        var actionKey: String? = null,
     )
 
     private val pickDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { chat.importDocuments(it) }
@@ -369,7 +402,12 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch { chat.state.collect(::render) }
-                launch { chat.status.collect { latestStatus = it; renderStatus() } }
+                launch { chat.status.collect {
+                    latestStatus = it
+                    chat.refreshModelStatus()
+                    renderStatus()
+                    refreshModelSettings()
+                } }
             }
         }
         chat.initialize()
@@ -568,6 +606,7 @@ class MainActivity : ComponentActivity() {
             previousBusy = state.busy
         }
         renderStatus()
+        refreshModelSettings()
         if (addedMessage || (stickToBottom && state.messages.isNotEmpty())) scrollToBottom()
     }
 
@@ -686,61 +725,276 @@ class MainActivity : ComponentActivity() {
 
     private fun showModelSettings() {
         modelDialog?.dismiss()
-        val state = chat.state.value
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(questionInput.windowToken, 0)
+        chat.refreshModelStatus()
         val dialog = Dialog(this)
         modelDialog = dialog
-        val panel = LinearLayout(this).apply {
+        val sheet = LinearLayout(this).apply {
+            tag = "settings.sheet"
+            accessibilityPaneTitle = "Settings"
             orientation = LinearLayout.VERTICAL; background = shape(Color.WHITE, 26)
-            setPadding(dp(23), dp(12), dp(23), dp(20))
+            setPadding(dp(20), dp(12), dp(20), dp(12))
         }
-        panel.addView(View(this).apply { background = shape(color("#D8E2E8"), 3) }, LinearLayout.LayoutParams(dp(34), dp(4)).apply {
-            gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(18)
+        sheet.addView(View(this).apply { background = shape(color("#D8E2E8"), 3) }, LinearLayout.LayoutParams(dp(34), dp(4)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(8)
         })
         val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        titleRow.addView(label("Settings", 23, true), LinearLayout.LayoutParams(0, -2, 1f))
-        titleRow.addView(iconButton(R.drawable.ic_close, "Close settings") { dialog.dismiss() }, LinearLayout.LayoutParams(dp(40), dp(40)))
-        panel.addView(titleRow)
-        panel.addView(label("YOUR LOCAL MODEL", 10, true).apply { setTextColor(teal); letterSpacing = .1f }, fullWidth(top = 17))
-        panel.addView(label(state.modelSummary, 14).apply { setTextIsSelectable(true) }, fullWidth(top = 8))
-        panel.addView(label("Import once. Your model stays on this phone and loads automatically. Use the approved Qwen3.5-4B files from the setup guide.", 13).apply {
+        titleRow.addView(label("Settings", 23, true).apply { tag = "settings.title" }, LinearLayout.LayoutParams(0, -2, 1f))
+        titleRow.addView(iconButton(R.drawable.ic_close, "Close settings") { dialog.dismiss() }.apply { tag = "settings.close" }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        sheet.addView(titleRow)
+        val operation = label("", 12).apply {
+            tag = "settings.activity"
+            setTextColor(muted); maxLines = 2; ellipsize = TextUtils.TruncateAt.END
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        sheet.addView(operation, fullWidth(bottom = 10))
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 0, 0, dp(12)) }
+        val (languageRow, languageState, languageDetail) = settingsStatusRow("Language model")
+        val (projectorRow, projectorState, projectorDetail) = settingsStatusRow("Vision file")
+        val (visionRow, visionState, visionDetail) = settingsStatusRow("Image analysis")
+        body.addView(languageRow, fullWidth())
+        body.addView(projectorRow, fullWidth(top = 9))
+        body.addView(visionRow, fullWidth(top = 9))
+        body.addView(label("Import once. Your saved model loads automatically. Use the approved Qwen3.5-4B files from the setup guide.", 12).apply {
             setTextColor(muted); setLineSpacing(dp(3).toFloat(), 1f)
-        }, fullWidth(top = 9))
-        panel.addView(settingsFileButton(chat.stagedModel?.let(::displayName) ?: "Choose Qwen3.5-4B-Q4_K_M.gguf", R.drawable.ic_document) {
+        }, fullWidth(top = 13))
+        val actions = LinearLayout(this).apply { tag = "settings.actions"; orientation = LinearLayout.VERTICAL }
+        body.addView(actions, fullWidth(top = 4))
+        body.addView(View(this).apply { setBackgroundColor(line) }, LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(18); bottomMargin = dp(14) })
+        body.addView(label("Diagnostics", 15, true).apply { tag = "settings.diagnostics" })
+        body.addView(label("Reproduce the issue, then collect logs. The report contains technical details; your messages, documents, and images are excluded.", 12).apply {
+            setTextColor(muted); setLineSpacing(dp(3).toFloat(), 1f)
+        }, fullWidth(top = 6))
+        val diagnosticsActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        diagnosticsActions.addView(textButton("Collect logs") { collectDiagnosticLogs() }.apply {
+            tag = "settings.collect-logs"; setTextColor(teal)
+            background = ripple(shape(color("#E8F3F0"), 10))
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(5) })
+        diagnosticsActions.addView(textButton("Clear logs") {
+            lifecycleScope.launch {
+                try {
+                    withContext(Dispatchers.IO) { AppDiagnostics.clear() }
+                    Toast.makeText(this@MainActivity, "Diagnostic logs cleared.", Toast.LENGTH_SHORT).show()
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { chat.reportError("Diagnostic logs could not be cleared. Please try again.") }
+            }
+        }.apply { tag = "settings.clear-logs" }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(5) })
+        body.addView(diagnosticsActions, fullWidth(top = 10))
+        val scroll = ScrollView(this).apply { tag = "settings.scroll"; isFillViewport = false; addView(body) }
+        sheet.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        modelSheet = ModelSheetViews(languageState, languageDetail, projectorState, projectorDetail,
+            visionState, visionDetail, operation, actions)
+        dialog.setContentView(sheet, ViewGroup.LayoutParams(-1, -1))
+        dialog.setOnDismissListener {
+            if (modelDialog === dialog) { modelDialog = null; modelSheet = null }
+        }
+        dialog.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT)); addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            attributes = attributes.apply { dimAmount = .24f }; setGravity(Gravity.BOTTOM)
+            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+        }
+        sheet.setOnApplyWindowInsetsListener { _, insets ->
+            sizeModelSettings(dialog, insets.getInsets(WindowInsets.Type.ime()).bottom)
+            insets
+        }
+        refreshModelSettings()
+        dialog.show()
+        dialog.window?.apply {
+            decorView.setPadding(dp(10), 0, dp(10), dp(10))
+        }
+        sizeModelSettings(dialog)
+        sheet.requestApplyInsets()
+    }
+
+    private fun sizeModelSettings(dialog: Dialog, keyboardBottom: Int = 0) {
+        if (modelDialog !== dialog) return
+        val metrics = windowManager.currentWindowMetrics
+        val bars = metrics.windowInsets.getInsetsIgnoringVisibility(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+        val available = (metrics.bounds.height() - bars.top - maxOf(bars.bottom, keyboardBottom)).coerceAtLeast(1)
+        val height = (available * .88f).toInt().coerceAtLeast(1)
+        if (dialog.window?.attributes?.height != height) dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, height)
+    }
+
+    private fun settingsStatusRow(title: String): Triple<LinearLayout, TextView, TextView> {
+        val key = title.lowercase(java.util.Locale.ROOT).replace(' ', '-')
+        val row = LinearLayout(this).apply {
+            tag = "settings.$key"
+            orientation = LinearLayout.VERTICAL; background = shape(soft, 14, line)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        val heading = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        heading.addView(label(title, 14, true), LinearLayout.LayoutParams(0, -2, 1f))
+        val state = label("Checking…", 11, true).apply { tag = "settings.$key.state"; setTextColor(teal); gravity = Gravity.END }
+        heading.addView(state, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(10) })
+        row.addView(heading)
+        val detail = label("Checking saved files…", 12).apply {
+            tag = "settings.$key.detail"
+            setTextColor(muted); setLineSpacing(dp(3).toFloat(), 1f); setTextIsSelectable(true)
+        }
+        row.addView(detail, fullWidth(top = 7))
+        return Triple(row, state, detail)
+    }
+
+    private fun refreshModelSettings() {
+        val views = modelSheet ?: return
+        val state = chat.state.value
+        val model = state.modelStatus
+        fun status(view: TextView, text: String, attention: Boolean = false) {
+            view.text = text
+            view.setTextColor(if (attention) color("#A83E35") else teal)
+        }
+        status(views.languageState, when {
+            model.modelLoading -> "Loading…"
+            model.modelLoaded -> "Ready"
+            model.modelIssue != null -> "Needs attention"
+            model.modelImported -> "Saved"
+            else -> "Not set up"
+        }, model.modelIssue != null && !model.modelLoading && !model.modelLoaded)
+        views.languageDetail.text = listOfNotNull(model.modelName ?: if (model.modelImported)
+            "A language model is saved on this phone." else "No language model imported.", model.modelIssue).joinToString("\n")
+        status(views.projectorState, if (model.projectorImported) "Saved" else "No file")
+        views.projectorDetail.text = model.projectorName ?: if (model.projectorImported) "A vision file is saved on this phone." else "No vision file imported."
+        status(views.visionState, when {
+            model.visionLoaded -> "Ready"
+            !model.projectorImported -> "Not enabled"
+            model.modelLoading && model.projectorImported -> "Loading…"
+            model.visionIssue != null -> "Unavailable"
+            model.projectorImported -> "Waiting for model"
+            else -> "Not enabled"
+        }, model.projectorImported && model.visionIssue != null && !model.visionLoaded)
+        views.visionDetail.text = when {
+            model.visionLoaded -> "Visual questions can use the saved vision file."
+            model.visionIssue != null -> model.visionIssue
+            model.projectorImported -> "Load the saved model to activate image analysis."
+            else -> "Add the matching vision file for visual questions. Reading printed text with OCR already works."
+        }
+        views.operation.text = when {
+            state.busy -> latestStatus
+            state.error != null -> state.error
+            else -> "Saved files and readiness update here automatically."
+        }
+        views.operation.setTextColor(if (!state.busy && state.error != null) color("#A83E35") else muted)
+        val actionKey = listOf(state.busy, model.modelImported, model.modelLoaded, model.projectorImported,
+            model.visionLoaded, model.modelIssue, model.visionIssue, chat.stagedModel, chat.stagedProjector).joinToString("|")
+        if (views.actionKey == actionKey) return
+        views.actionKey = actionKey
+        views.actions.removeAllViews()
+        val dialog = modelDialog ?: return
+        fun addAction(view: View, top: Int = 9) {
+            view.isEnabled = !state.busy
+            view.alpha = if (state.busy) .45f else 1f
+            views.actions.addView(view, fullWidth(top = top))
+        }
+        addAction(settingsFileButton(if (model.modelImported) "Change language model" else "Choose Qwen3.5-4B model", R.drawable.ic_document) {
             dialog.dismiss(); pickModel.launch(arrayOf("*/*"))
-        }, fullWidth(top = 18))
-        panel.addView(settingsFileButton(chat.stagedProjector?.let(::displayName) ?: "Add mmproj-F16.gguf · optional", R.drawable.ic_camera) {
-            dialog.dismiss(); pickProjector.launch(arrayOf("*/*"))
-        }, fullWidth(top = 9))
-        if (chat.stagedProjector != null) panel.addView(textButton("Remove selected vision file") {
-            chat.stagedProjector = null; showModelSettings()
-        }, fullWidth(top = 3))
-        if (chat.stagedModel != null) panel.addView(primaryButton("Import & use model") {
-            dialog.dismiss(); chat.configureModel()
-        }.apply { isEnabled = !state.busy; alpha = if (state.busy) .45f else 1f }, fullWidth(top = 14))
-        else if (state.hasModel && !state.modelReady && !state.busy) panel.addView(primaryButton("Load saved model") {
-            dialog.dismiss(); chat.retrySavedModel()
-        }, fullWidth(top = 14))
-        if (state.busy) panel.addView(label("${latestStatus}\nYou can stop the current action from the chat screen.", 12).apply { setTextColor(muted) }, fullWidth(top = 12))
-        panel.addView(View(this).apply { setBackgroundColor(line) }, LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(19); bottomMargin = dp(7) })
-        panel.addView(textButton("New conversation") { dialog.dismiss(); chat.newChat() }.apply { isEnabled = !state.busy }, fullWidth())
-        panel.addView(label("A new conversation starts without earlier messages or attachments. Your model stays loaded.", 11).apply { setTextColor(muted) }, fullWidth(top = 3))
-        panel.addView(textButton("Clear imported files") {
+        }, 12)
+        if (!model.projectorImported || chat.stagedModel != null) {
+            addAction(settingsFileButton("Choose mmproj-F16.gguf vision file", R.drawable.ic_camera) {
+                dialog.dismiss(); pickProjector.launch(arrayOf("*/*"))
+            })
+        }
+        chat.stagedModel?.let { uri ->
+            views.actions.addView(label("Selected language model · not applied\n${selectedFileName(uri)}", 12).apply {
+                setTextColor(teal); setTextIsSelectable(true)
+            }, fullWidth(top = 12))
+        }
+        chat.stagedProjector?.let { uri ->
+            views.actions.addView(label("Selected vision file · not applied\n${selectedFileName(uri)}", 12).apply {
+                setTextColor(teal); setTextIsSelectable(true)
+            }, fullWidth(top = 9))
+            addAction(textButton("Remove selected vision file") { chat.stagedProjector = null; refreshModelSettings() }, 3)
+        }
+        when {
+            chat.stagedModel != null -> addAction(primaryButton("Import & use selected model") { chat.configureModel() }, 13)
+            chat.stagedProjector != null && model.modelImported && !model.projectorImported ->
+                addAction(primaryButton("Use saved model + selected vision file") { chat.configureSelectedProjector() }, 13)
+            chat.stagedProjector != null && !model.modelImported -> views.actions.addView(label("Select a language model first, then apply both files together.", 12).apply {
+                setTextColor(muted)
+            }, fullWidth(top = 10))
+            chat.stagedProjector != null && model.projectorImported -> views.actions.addView(label("A vision file is already saved. Retry the saved model if image analysis is unavailable, or choose a language model to replace both files together.", 12).apply {
+                setTextColor(muted)
+            }, fullWidth(top = 10))
+        }
+        if (model.modelImported && (!model.modelLoaded || (model.projectorImported && !model.visionLoaded))) {
+            addAction(primaryButton(if (model.modelIssue != null || model.visionIssue != null) "Retry saved model" else "Load saved model") { chat.retrySavedModel() }, 12)
+        }
+        views.actions.addView(View(this).apply { setBackgroundColor(line) }, LinearLayout.LayoutParams(-1, dp(1)).apply {
+            topMargin = dp(18); bottomMargin = dp(5)
+        })
+        addAction(textButton("New conversation") { dialog.dismiss(); chat.newChat() }, 0)
+        views.actions.addView(label("A new conversation clears earlier messages and attachments. Your model stays loaded.", 11).apply { setTextColor(muted) }, fullWidth(top = 3))
+        addAction(textButton("Clear imported files") {
             dialog.dismiss()
             AlertDialog.Builder(this).setTitle("Clear imported files?")
                 .setMessage("Delete this app’s imported document and image copies and clear this conversation. Your original files and saved model will be kept.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Clear copies") { _, _ -> chat.clearImportedFiles() }.show()
-        }.apply { isEnabled = !state.busy }, fullWidth(top = 8))
-        dialog.setContentView(ScrollView(this).apply { addView(panel) })
+        }, 8)
+    }
+
+    private fun selectedFileName(uri: Uri): String = selectedFileNames.getOrPut(uri.toString()) { displayName(uri) }
+
+    private fun collectDiagnosticLogs() {
+        if (collectingLogs) return
+        collectingLogs = true
+        lifecycleScope.launch {
+            try {
+                val report = withContext(Dispatchers.IO) {
+                    AppDiagnostics.collectReport(applicationContext, chat.controller.modelStatus())
+                }
+                showDiagnosticReport(report)
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { chat.reportError("Diagnostic logs could not be collected. Please try again.") }
+            finally { collectingLogs = false }
+        }
+    }
+
+    private fun showDiagnosticReport(report: String) {
+        diagnosticsDialog?.dismiss()
+        val dialog = Dialog(this)
+        diagnosticsDialog = dialog
+        val sheet = LinearLayout(this).apply {
+            tag = "diagnostics.report"; accessibilityPaneTitle = "Diagnostic logs"
+            orientation = LinearLayout.VERTICAL; background = shape(Color.WHITE, 24)
+            setPadding(dp(18), dp(12), dp(18), dp(14))
+        }
+        val heading = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        heading.addView(label("Diagnostic logs", 21, true), LinearLayout.LayoutParams(0, -2, 1f))
+        heading.addView(iconButton(R.drawable.ic_close, "Close diagnostic logs") { dialog.dismiss() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        sheet.addView(heading)
+        sheet.addView(label("Review this technical report before sharing it to help diagnose the issue.", 12).apply {
+            setTextColor(muted); setLineSpacing(dp(3).toFloat(), 1f)
+        }, fullWidth(bottom = 10))
+        val export = AnswerExport("Diagnostic logs (.txt)", "pocket-agent-diagnostics.txt", "text/plain", report)
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val buttons = listOf(
+            textButton("Copy") { copyToClipboard(report) }.apply { tag = "diagnostics.copy" },
+            textButton("Download") { exportOutput(export, share = false) }.apply { tag = "diagnostics.download" },
+            textButton("Share") { exportOutput(export, share = true) }.apply { tag = "diagnostics.share" },
+        )
+        buttons.forEachIndexed { index, button ->
+            button.setTextColor(teal); button.background = ripple(shape(color("#E8F3F0"), 10))
+            actions.addView(button, LinearLayout.LayoutParams(0, -2, 1f).apply { if (index > 0) marginStart = dp(6) })
+        }
+        sheet.addView(actions, fullWidth(bottom = 12))
+        val text = label(report, 12).apply {
+            typeface = Typeface.MONOSPACE; setTextIsSelectable(true)
+            setLineSpacing(dp(3).toFloat(), 1f); setPadding(dp(10), dp(10), dp(10), dp(10))
+            background = shape(soft, 10)
+        }
+        sheet.addView(ScrollView(this).apply { addView(text) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        dialog.setContentView(sheet, ViewGroup.LayoutParams(-1, -1))
+        dialog.setOnDismissListener { if (diagnosticsDialog === dialog) diagnosticsDialog = null }
         dialog.window?.apply {
             setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT)); addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-            attributes = attributes.apply { dimAmount = .24f }; setGravity(Gravity.BOTTOM)
+            attributes = attributes.apply { dimAmount = .28f }; setGravity(Gravity.BOTTOM)
+            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
         }
         dialog.show()
-        dialog.window?.apply {
-            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            decorView.setPadding(dp(10), dp(24), dp(10), dp(10))
-        }
+        val metrics = windowManager.currentWindowMetrics
+        val bars = metrics.windowInsets.getInsetsIgnoringVisibility(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+        val height = ((metrics.bounds.height() - bars.top - bars.bottom) * .88f).toInt().coerceAtLeast(1)
+        dialog.window?.apply { setLayout(-1, height); decorView.setPadding(dp(10), 0, dp(10), dp(10)) }
     }
 
     private fun settingsFileButton(title: String, icon: Int, click: () -> Unit) = LinearLayout(this).apply {
@@ -785,7 +1039,7 @@ class MainActivity : ComponentActivity() {
     private fun copyToClipboard(plain: String, html: String? = null) {
         val maximumBytes = 200_000
         if (plain.length > maximumBytes || plain.toByteArray(Charsets.UTF_8).size > maximumBytes) {
-            chat.reportError("This answer is too large for the clipboard. Use Download to save the full output.")
+            chat.reportError("This output is too large for the clipboard. Use Download to save the full output.")
             return
         }
         try {
@@ -799,7 +1053,7 @@ class MainActivity : ComponentActivity() {
             }
             (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
         } catch (_: Exception) {
-            chat.reportError("The full answer could not be copied. Use Download to save it instead.")
+            chat.reportError("The full output could not be copied. Use Download to save it instead.")
         }
     }
 
@@ -807,31 +1061,35 @@ class MainActivity : ComponentActivity() {
         val options = AnswerExports.options(message.text, "pocket-agent-answer-${message.id}")
         AlertDialog.Builder(this).setTitle(if (share) "Share answer as" else "Download answer as")
             .setItems(options.map { it.label }.toTypedArray()) { _, index ->
-                lifecycleScope.launch {
-                    try {
-                        val export = chat.stageExport(options[index])
-                        if (share) {
-                            val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.files", chat.exportFile(export))
-                            val intent = Intent(Intent.ACTION_SEND).apply {
-                                type = export.mimeType
-                                putExtra(Intent.EXTRA_STREAM, uri)
-                                clipData = ClipData.newUri(contentResolver, "Pocket Agent answer", uri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                            startActivity(Intent.createChooser(intent, "Share answer"))
-                        } else {
-                            chat.discardExport(chat.pendingDownload)
-                            chat.pendingDownload = export
-                            createAnswerDocument.launch(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                                addCategory(Intent.CATEGORY_OPENABLE)
-                                type = export.mimeType
-                                putExtra(Intent.EXTRA_TITLE, export.fileName)
-                            })
-                        }
-                    } catch (cancelled: CancellationException) { throw cancelled }
-                    catch (error: Exception) { chat.reportError(error.message ?: "This answer could not be exported.") }
-                }
+                exportOutput(options[index], share)
             }.show()
+    }
+
+    private fun exportOutput(output: AnswerExport, share: Boolean) {
+        lifecycleScope.launch {
+            try {
+                val export = chat.stageExport(output)
+                if (share) {
+                    val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.files", chat.exportFile(export))
+                    val intent = Intent(Intent.ACTION_SEND).apply {
+                        type = export.mimeType
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        clipData = ClipData.newUri(contentResolver, output.fileName, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(Intent.createChooser(intent, "Share output"))
+                } else {
+                    chat.discardExport(chat.pendingDownload)
+                    chat.pendingDownload = export
+                    createAnswerDocument.launch(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = export.mimeType
+                        putExtra(Intent.EXTRA_TITLE, export.fileName)
+                    })
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { chat.reportError(error.message ?: "This output could not be exported.") }
+        }
     }
 
     private fun chooseDocuments() {
@@ -915,7 +1173,7 @@ class MainActivity : ComponentActivity() {
         }
     }
     override fun onDestroy() {
-        modelDialog?.dismiss(); super.onDestroy()
+        diagnosticsDialog?.dismiss(); modelDialog?.dismiss(); super.onDestroy()
         // The retained ViewModel closes the model only when the conversation is actually finished.
     }
 }

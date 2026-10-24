@@ -11,6 +11,7 @@ import com.offline.pocketagent.documents.DocumentExtractor
 import com.offline.pocketagent.documents.DocumentSection
 import com.offline.pocketagent.documents.ExtractedDocument
 import com.offline.pocketagent.documents.ImageDecodeLimits
+import com.offline.pocketagent.diagnostics.AppDiagnostics
 import com.offline.pocketagent.inference.ChatMessage
 import com.offline.pocketagent.inference.LocalInference
 import com.offline.pocketagent.security.TrustedModelPolicy
@@ -18,9 +19,11 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -37,12 +40,22 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
     private val inference = LocalInference(app)
     private val mutex = Mutex()
     private val session = ConversationSession()
+    private val documentKinds = ConcurrentHashMap<String, String>()
     @Volatile private var activeOperation: Job? = null
     @Volatile private var modelContextNeedsReset = false
+    @Volatile private var modelLoading = false
+    @Volatile private var lastModelIssue: String? = null
     private var lastRequestDocumentIds: Set<String>? = null
+
+    init {
+        AppDiagnostics.initialize(app)
+        AppDiagnostics.event("app_start")
+    }
 
     suspend fun importDocument(uri: Uri): ImportedDocument = mutex.withLock {
         withActiveOperation {
+            val importStarted = System.nanoTime()
+            AppDiagnostics.event("document_import_start")
             val importScope = session.snapshot(emptyList())
             require((documentsRoot.listFiles()?.count { File(it, "document.json").isFile } ?: 0) < MAX_DOCUMENTS) {
                 "Private import storage holds at most $MAX_DOCUMENTS files. Use Settings → Clear imported files to free it; your originals and saved model will stay."
@@ -60,8 +73,22 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                 if (!session.attachIfCurrent(id, importScope.generation)) {
                     throw CancellationException("The conversation changed while this file was being imported.")
                 }
+                documentKinds[id] = extracted.kind
+                val metrics = linkedMapOf(
+                    "count" to "1", "duration_ms" to elapsedMillis(importStarted), "bytes" to copy.length().toString(),
+                    "section_count" to extracted.sections.size.toString(),
+                    "extracted_chars" to extracted.sections.sumOf { it.text.codePointCount(0, it.text.length).toLong() }.toString(),
+                    "extraction_complete" to extracted.extractionComplete.toString(), "warning_count" to extracted.warnings.size.toString(),
+                )
+                if (extracted.kind in setOf("pdf", "docx", "xlsx", "image")) metrics["kind"] = extracted.kind
+                extracted.totalPages?.let { metrics["total_pages"] = it.toString() }
+                extracted.processedPages?.let { metrics["processed_pages"] = it.toString() }
+                AppDiagnostics.event("document_import_complete", metrics)
                 entry.toImported()
             } catch (error: Exception) {
+                AppDiagnostics.failure("document_import_failed", error)
+                AppDiagnostics.event("document_import_failed", mapOf("duration_ms" to elapsedMillis(importStarted),
+                    "result" to if (error is CancellationException) "cancelled" else "failed"))
                 directory.deleteRecursively()
                 throw error
             }
@@ -96,9 +123,11 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
 
     suspend fun configureModel(modelUri: Uri, projectorUri: Uri? = null): String = mutex.withLock {
         withActiveOperation {
+          trackModelOperation("model_import") {
             val directory = File(modelsRoot, UUID.randomUUID().toString()).apply { mkdirs() }
             try {
                 val name = displayName(modelUri)
+                val projectorName = projectorUri?.let(::displayName)
                 onStatus("Copying $name to private storage. Large models can take a while…")
                 var modelDigest: String? = null
                 val model = copyFromUri(modelUri, File(directory, "model.gguf"), MAX_MODEL_BYTES) { modelDigest = it }
@@ -118,13 +147,90 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                 lastRequestDocumentIds = null
                 preferences.edit().putString("model_path", model.absolutePath)
                     .putString("model_name", name)
-                    .putString("projector_path", projector?.absolutePath).apply()
+                    .putString("projector_path", projector?.absolutePath)
+                    .putString("projector_name", projectorName).apply()
                 modelsRoot.listFiles()?.filter { it != directory }?.forEach { it.deleteRecursively() }
                 "Loaded $name${visionSummary()}"
-            } catch (error: Exception) {
+            } catch (error: Throwable) {
                 directory.deleteRecursively()
                 throw error
             }
+          }
+        }
+    }
+
+    /** Adds a missing projector beside the verified saved model without copying its multi-gigabyte weights again. */
+    suspend fun configureVisionProjector(projectorUri: Uri): String = mutex.withLock {
+        withActiveOperation {
+          trackModelOperation("vision_import") {
+            val model = requireNotNull(preferences.getString("model_path", null)?.let(::File)?.takeIf { it.isFile }) {
+                "Import the language model before adding its vision file."
+            }
+            val trust = TrustedModelPolicy(app)
+            trust.verify(model, TrustedModelPolicy.Role.MODEL)
+            val target = File(model.parentFile, TrustedModelPolicy.Role.PROJECTOR.fileName)
+            val previousPath = preferences.getString("projector_path", null)
+            val previousName = preferences.getString("projector_name", null)
+            val plan = ProjectorImportRecovery.prepare(
+                target, previousPath?.let(::File),
+                targetMayBeInUse = inference.isVisionEnabled || inference.visionUnavailableReason != null,
+                verifyApproved = { trust.verify(it, TrustedModelPolicy.Role.PROJECTOR) },
+            )
+            val wasLoaded = inference.isLoaded
+            var loadAttempted = false
+            var preferencesTouched = false
+            var ownsProjector = false
+            try {
+                val name = if (plan == ProjectorImportPlan.REUSE_VERIFIED_ORPHAN) {
+                    onStatus("Recovering an approved vision file from an interrupted setup…")
+                    "${target.name} (recovered approved file)"
+                } else {
+                    displayName(projectorUri).also { selectedName ->
+                        onStatus("Copying $selectedName. Your saved language model will be reused…")
+                        var digest: String? = null
+                        copyFromUri(projectorUri, target, MAX_PROJECTOR_BYTES) {
+                            digest = it
+                            ownsProjector = true
+                        }
+                        requireGguf(target)
+                        trust.verify(target, TrustedModelPolicy.Role.PROJECTOR, digest)
+                    }
+                }
+                onStatus("Activating image analysis with the saved model…")
+                loadAttempted = true
+                inference.loadModel(model, target)
+                modelContextNeedsReset = false
+                lastRequestDocumentIds = null
+                check(preferences.getString("model_path", null) == model.absolutePath) {
+                    "The selected language model changed during vision setup. Reopen Settings and try again."
+                }
+                preferencesTouched = true
+                check(preferences.edit().putString("projector_path", target.absolutePath)
+                    .putString("projector_name", name).commit()) {
+                    "The vision setup could not be saved. Your language model is still imported."
+                }
+                "Vision file imported: $name${visionSummary()}"
+            } catch (error: Throwable) {
+                // Native load owns and closes any failed/cancelled attempt before
+                // returning. Restore the prior text session before removing the
+                // uncommitted projector; the saved base weights are never removed.
+                withContext(NonCancellable + Dispatchers.IO) {
+                    if (preferencesTouched) preferences.edit().putString("projector_path", previousPath)
+                        .putString("projector_name", previousName).commit()
+                    if (loadAttempted && wasLoaded) {
+                        try {
+                            inference.loadModel(model, null)
+                            modelContextNeedsReset = true
+                            lastRequestDocumentIds = null
+                        } catch (restoreError: Throwable) {
+                            if (restoreError !== error) error.addSuppressed(restoreError)
+                        }
+                    }
+                    if (ownsProjector) target.delete()
+                }
+                throw error
+            }
+          }
         }
     }
 
@@ -132,15 +238,20 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
 
     suspend fun warmUpSavedModel(): Boolean = mutex.withLock {
         withActiveOperation {
-            if (inference.isLoaded) true else {
-                val model = preferences.getString("model_path", null)?.let(::File)?.takeIf { it.isFile }
-                if (model == null) false else {
-                    val projector = preferences.getString("projector_path", null)?.let(::File)?.takeIf { it.isFile }
+            val model = preferences.getString("model_path", null)?.let(::File)?.takeIf { it.isFile }
+            val projector = preferences.getString("projector_path", null)?.let(::File)?.takeIf { it.isFile }
+            // A saved projector that failed native activation must actually be
+            // retried even if the shared text backbone is already loaded.
+            if (inference.isLoaded && (projector == null || inference.isVisionEnabled)) {
+                lastModelIssue = null
+                onStatus(modelSummary())
+                true
+            } else {
+                if (model == null) false else trackModelOperation {
                     onStatus("Loading your saved local model…")
                     inference.loadModel(model, projector)
                     modelContextNeedsReset = false
                     lastRequestDocumentIds = null
-                    onStatus("Ready. ${modelSummary()}")
                     true
                 }
             }
@@ -151,57 +262,160 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
         question: String,
         documentIds: List<String>? = null,
         onPartial: (String) -> Unit = {},
-    ): AgentAnswer = mutex.withLock {
-        withActiveOperation {
-            require(question.isNotBlank()) { "Enter a question first." }
-            require(question.length <= 2_000) { "Please keep your question under 2,000 characters." }
+    ): AgentAnswer {
+        val timing = RequestTiming(UUID.randomUUID().mostSignificantBits and Long.MAX_VALUE)
+        return try {
             val scope = session.snapshot(documentIds)
-            val library = readLibrary(scope.documentIds)
-            require(library.size == scope.documentIds.size) {
-                "An attachment could not be reopened. Start a new conversation, then add that file again."
+            AppDiagnostics.event("request_start", mapOf(
+                "request_id" to timing.requestId.toString(), "text_ready" to inference.isLoaded.toString(),
+                "vision_ready" to inference.isVisionEnabled.toString(),
+                "document_count" to scope.documentIds.size.toString(),
+                "image_count" to scope.documentIds.count { documentKinds[it] == "image" }.toString(),
+                "session_scope_count" to session.documentIds().size.toString(),
+            ))
+            val result = mutex.withLock {
+                timing.acquired()
+                withActiveOperation {
+                    require(question.isNotBlank()) { "Enter a question first." }
+                    require(question.length <= 2_000) { "Please keep your question under 2,000 characters." }
+                    if (!session.isCurrent(scope)) throw CancellationException("The conversation changed while this request was waiting.")
+                    val library = readLibrary(scope.documentIds)
+                    require(library.size == scope.documentIds.size) {
+                        "An attachment could not be reopened. Start a new conversation, then add that file again."
+                    }
+                    if (!inference.isLoaded) {
+                        val model = preferences.getString("model_path", null)?.let(::File)
+                        require(model?.isFile == true) { "Choose and load a local GGUF model first. Document import and OCR already work without one." }
+                        val projector = preferences.getString("projector_path", null)?.let(::File)?.takeIf { it.isFile }
+                        trackModelOperation {
+                            onStatus("Loading your saved local model…")
+                            inference.loadModel(model, projector)
+                        }
+                        modelContextNeedsReset = false
+                        lastRequestDocumentIds = null
+                    }
+                    val requestIds = scope.documentIds.toSet()
+                    if (modelContextNeedsReset || (lastRequestDocumentIds != null && lastRequestDocumentIds != requestIds)) {
+                        inference.resetConversationContext()
+                        modelContextNeedsReset = false
+                    }
+                    lastRequestDocumentIds = requestIds
+                    val engine = AgentEngine(
+                        generate = { prompt, image ->
+                            runInference(prompt, image, maxTokens = 256)
+                        },
+                        onStatus = onStatus,
+                        streamGenerate = { prompt, image, maximum, onDelta ->
+                            runInference(prompt, image, maximum, onDelta)
+                        },
+                    )
+                    val scopedPartial: (String) -> Unit = { text ->
+                        if (session.isCurrent(scope)) {
+                            onPartial(text)
+                            if (timing.outputDelivered(text.codePointCount(0, text.length))) {
+                                AppDiagnostics.event("request_first_reply", timing.fields())
+                            }
+                        }
+                    }
+                    timing.processing()
+                    val answer = engine.respond(question.trim(), library, inference.isVisionEnabled, scopedPartial, scope.history,
+                        visionUnavailableReason = inference.visionUnavailableReason)
+                    if (!session.remember(scope, question, answer.text)) {
+                        throw CancellationException("The conversation changed while the response was being generated.")
+                    }
+                    answer
+                }
             }
-            if (!inference.isLoaded) {
-                val model = preferences.getString("model_path", null)?.let(::File)
-                require(model?.isFile == true) { "Choose and load a local GGUF model first. Document import and OCR already work without one." }
-                val projector = preferences.getString("projector_path", null)?.let(::File)?.takeIf { it.isFile }
-                onStatus("Loading your saved local model…")
-                inference.loadModel(model, projector)
-                modelContextNeedsReset = false
-                lastRequestDocumentIds = null
-            }
-            val requestIds = scope.documentIds.toSet()
-            if (modelContextNeedsReset || (lastRequestDocumentIds != null && lastRequestDocumentIds != requestIds)) {
-                inference.resetConversationContext()
-                modelContextNeedsReset = false
-            }
-            lastRequestDocumentIds = requestIds
-            val engine = AgentEngine(
-                generate = { prompt, image ->
-                    runInference(prompt, image, maxTokens = 256)
-                },
-                onStatus = onStatus,
-                streamGenerate = { prompt, image, maximum, onDelta ->
-                    runInference(prompt, image, maximum, onDelta)
-                },
-            )
-            val scopedPartial: (String) -> Unit = { text -> if (session.isCurrent(scope)) onPartial(text) }
-            val result = engine.respond(question.trim(), library, inference.isVisionEnabled, scopedPartial, scope.history,
-                visionUnavailableReason = inference.visionUnavailableReason)
-            if (!session.remember(scope, question, result.text)) {
-                throw CancellationException("The conversation changed while the response was being generated.")
-            }
+            AppDiagnostics.event("request_complete", timing.fields(result.text.codePointCount(0, result.text.length)) + ("result" to "success"))
             result
+        } catch (cancelled: CancellationException) {
+            AppDiagnostics.event("request_cancelled", timing.fields() + ("result" to "cancelled"))
+            throw cancelled
+        } catch (error: Throwable) {
+            AppDiagnostics.failure("request_failed", error)
+            AppDiagnostics.event("request_failed", timing.fields() + ("result" to "failed"))
+            throw error
         }
     }
 
     fun modelSummary(): String {
-        val name = preferences.getString("model_name", null)
+        val status = modelStatus()
+        val name = status.modelName
         return when {
-            inference.isLoaded -> "${name ?: "Local model"} is ready${visionSummary()}."
-            name != null && hasSavedModel() -> "$name is saved and loads automatically when the app opens."
+            status.modelLoading -> "Loading ${name ?: "your local model"}…"
+            status.modelLoaded -> "${name ?: "Local model"} is ready${visionSummary()}."
+            status.modelIssue != null -> status.modelIssue
+            name != null && status.modelImported -> "$name is saved and loads automatically when the app opens."
             else -> "No model loaded. Choose a GGUF model to enable answers."
         }
     }
+
+    /** A cheap synchronous snapshot for the model settings dialog; no hashing or native calls are performed here. */
+    fun modelStatus(): ModelStatus {
+        val saved = preferences.all
+        val model = (saved["model_path"] as? String)?.let(::File)
+        val projector = (saved["projector_path"] as? String)?.let(::File)
+        val imported = model?.isFile == true
+        val projectorImported = projector?.isFile == true
+        val loaded = inference.isLoaded
+        val visionLoaded = inference.isVisionEnabled
+        val nativeVisionIssue = inference.visionUnavailableReason
+        return ModelStatus(
+            modelName = saved["model_name"] as? String ?: model?.name,
+            modelImported = imported,
+            modelLoaded = loaded,
+            modelLoading = modelLoading,
+            modelIssue = lastModelIssue ?: if (model != null && !imported) "The saved model file is unavailable. Import it again." else null,
+            projectorName = saved["projector_name"] as? String ?: projector?.name,
+            projectorImported = projectorImported,
+            visionLoaded = visionLoaded,
+            visionIssue = when {
+                visionLoaded -> null
+                nativeVisionIssue != null -> nativeVisionIssue
+                projector != null && !projectorImported -> "The saved vision file is unavailable. Import it again."
+                !projectorImported -> "No vision file has been imported."
+                !loaded -> "Load the saved model to activate image analysis."
+                else -> "The saved vision file has not been activated. Retry loading the saved model."
+            },
+        )
+    }
+
+    private suspend fun <T> trackModelOperation(operation: String = "model_load", block: suspend () -> T): T {
+        val started = System.nanoTime()
+        val stages = when (operation) {
+            "model_import" -> "model_import_start" to "model_import_complete"
+            "vision_import" -> "vision_import_start" to "vision_import_complete"
+            else -> "model_load_start" to "model_load_complete"
+        }
+        modelLoading = true
+        lastModelIssue = null
+        var result = "success"
+        AppDiagnostics.event(stages.first)
+        onStatus("Preparing local model setup…")
+        return try {
+            block()
+        } catch (error: Throwable) {
+            result = if (error is CancellationException) "cancelled" else "failed"
+            AppDiagnostics.failure("model_operation_failed", error)
+            lastModelIssue = if (error is CancellationException) "Model setup was stopped." else error.message ?: "The local model could not be loaded."
+            throw error
+        } finally {
+            modelLoading = false
+            val snapshot = modelStatus()
+            val duration = elapsedMillis(started)
+            val metrics = linkedMapOf(
+                "text_ready" to snapshot.modelLoaded.toString(), "vision_ready" to snapshot.visionLoaded.toString(),
+                "model_saved" to snapshot.modelImported.toString(), "projector_saved" to snapshot.projectorImported.toString(),
+                "duration_ms" to duration,
+                "result" to result,
+            )
+            if (operation == "model_load") metrics["model_load_ms"] = duration
+            AppDiagnostics.event(stages.second, metrics)
+            onStatus(lastModelIssue ?: modelSummary())
+        }
+    }
+
+    private fun elapsedMillis(started: Long): String = ((System.nanoTime() - started) / 1_000_000L).coerceAtLeast(0L).toString()
 
     fun cancelGeneration() {
         activeOperation?.cancel(CancellationException("Cancelled by the user."))
@@ -210,7 +424,9 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
     fun clearConversation() {
         check(activeOperation == null) { "Wait for the current operation to finish before starting a new conversation." }
         session.clear()
+        documentKinds.clear()
         modelContextNeedsReset = inference.isLoaded
+        AppDiagnostics.event("conversation_cleared")
     }
 
     fun newConversation() = clearConversation()
@@ -219,6 +435,7 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
     suspend fun clearImportedDocuments(): Int = mutex.withLock {
         withActiveOperation {
             session.clear()
+            documentKinds.clear()
             modelContextNeedsReset = inference.isLoaded
             val root = documentsRoot.canonicalFile
             var removed = 0
@@ -229,6 +446,7 @@ class AppController(context: Context, private val onStatus: (String) -> Unit = {
                 if (directory.deleteRecursively()) removed++ else failures += directory.name
             }
             check(failures.isEmpty()) { "Some private imported copies could not be cleared. Close the app and try again; your saved model was not changed." }
+            AppDiagnostics.event("documents_cleared", mapOf("count" to removed.toString()))
             onStatus("Cleared $removed private imported files. Your originals and model are unchanged.")
             removed
         }

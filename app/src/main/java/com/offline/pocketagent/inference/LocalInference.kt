@@ -14,10 +14,13 @@ import com.geniex.sdk.bean.SamplerConfig
 import com.geniex.sdk.bean.VlmChatMessage
 import com.geniex.sdk.bean.VlmContent
 import com.geniex.sdk.bean.VlmCreateInput
+import com.offline.pocketagent.diagnostics.AppDiagnostics
 import com.offline.pocketagent.security.TrustedModelPolicy
 import java.io.Closeable
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -57,6 +60,7 @@ class LocalInference(context: Context) : Closeable {
     // outer mutex while holding this guard: stop must remain callable mid-generate.
     private val nativeLifetimeMutex = Mutex()
     private val nativeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val nextInferenceId = AtomicLong(0)
     @Volatile private var llm: LlmWrapper? = null
     @Volatile private var vlm: NativeVisionSession? = null
     private var loadedAttempt: Any? = null
@@ -87,9 +91,12 @@ class LocalInference(context: Context) : Closeable {
                 projectorFile?.let { trust.verify(it, TrustedModelPolicy.Role.PROJECTOR) }
                 currentCoroutineContext().ensureActive()
                 check(!closed) { "The inference session is closed." }
+                AppDiagnostics.event("native_model_load_start", mapOf(
+                    "projector_requested" to (projectorFile != null).toString(),
+                ))
                 destroyModels()
                 loadedAttempt = attempt
-                initializeSdk()
+                inferenceStage("SDK initialization") { initializeSdk() }
                 val config = ModelConfig(
                     nCtx = 8192,
                     nThreads = 4,
@@ -144,6 +151,14 @@ class LocalInference(context: Context) : Closeable {
                     }
                 }
                 check(!closed) { "The inference session was closed while loading." }
+                AppDiagnostics.event("native_vision_capability", mapOf(
+                    "projector_requested" to (projectorFile != null).toString(),
+                    "vision_ready" to isVisionEnabled.toString(),
+                ))
+                AppDiagnostics.event("native_model_load_complete", mapOf(
+                    "text_ready" to isLoaded.toString(),
+                    "vision_ready" to isVisionEnabled.toString(),
+                ))
               }
             }
         } catch (error: Throwable) {
@@ -197,21 +212,34 @@ class LocalInference(context: Context) : Closeable {
                 // The external scope lets cancellation call stopStream while native generate
                 // occupies a worker thread. Await termination before releasing the model lock.
                 val callerContext = currentCoroutineContext()
+                // This boundary excludes controller routing/model loading and time
+                // waiting for the inference mutex. It includes worker scheduling,
+                // reset/template work, prefill/encoding, decoding, and stop cleanup.
+                val measurements = InferenceMeasurements(nextInferenceId.incrementAndGet(), imageFile != null)
                 val generation = nativeScope.async {
-                    generateLocked(messages, imageFile, maxTokens) { delta ->
+                    generateLocked(messages, imageFile, maxTokens, measurements) { delta ->
                         if (callerContext.isActive) onToken?.invoke(delta)
                     }
                 }
                 try {
-                    generation.await()
+                    generation.await().also {
+                        AppDiagnostics.event("inference_complete", measurements.fields())
+                    }
                 } catch (cancelled: CancellationException) {
-                    withContext(NonCancellable) {
-                        requestStopStreams()
-                        generation.cancelAndJoin()
-                        runCatching { llm?.reset() }
-                        runCatching { vlm?.reset() }
+                    try {
+                        withContext(NonCancellable) {
+                            requestStopStreams()
+                            generation.cancelAndJoin()
+                            runCatching { llm?.reset() }
+                            runCatching { vlm?.reset() }
+                        }
+                    } finally {
+                        AppDiagnostics.event("inference_cancelled", measurements.fields())
                     }
                     throw cancelled
+                } catch (error: Throwable) {
+                    AppDiagnostics.event("inference_failed", measurements.fields())
+                    throw error
                 }
             }
         }
@@ -220,6 +248,7 @@ class LocalInference(context: Context) : Closeable {
         messages: List<ChatMessage>,
         imageFile: File?,
         maxTokens: Int,
+        measurements: InferenceMeasurements,
         onToken: (String) -> Unit,
     ): String {
         val config = GenerationConfig(
@@ -253,7 +282,7 @@ class LocalInference(context: Context) : Closeable {
             config.imagePaths = imageFile?.let { arrayOf(it.absolutePath) }
             config.imageCount = if (imageFile == null) 0 else 1
             return inferenceStage("$stage generation") {
-                collectOutput(visionStream(vision, prompt, config), onToken)
+                collectOutput(visionStream(vision, prompt, config), measurements, onToken)
             }
         }
         val text = checkNotNull(llm) { "No local model is loaded." }
@@ -268,7 +297,7 @@ class LocalInference(context: Context) : Closeable {
             ).getOrThrow().formattedText
         }
         return inferenceStage("Text generation") {
-            collectOutput(text.generateStreamFlow(prompt = prompt, config = config), onToken)
+            collectOutput(text.generateStreamFlow(prompt = prompt, config = config), measurements, onToken)
         }
     }
 
@@ -301,16 +330,52 @@ class LocalInference(context: Context) : Closeable {
         awaitClose { }
     }
 
-    private suspend fun <T> inferenceStage(label: String, action: suspend () -> T): T = try {
-        action()
-    } catch (cancelled: CancellationException) {
-        throw cancelled
-    } catch (error: Exception) {
-        throw IllegalStateException("$label failed: ${error.message?.take(300) ?: error.javaClass.simpleName}", error)
+    private suspend fun <T> inferenceStage(label: String, action: suspend () -> T): T {
+        val phase = diagnosticPhase(label)
+        val started = System.nanoTime()
+        // The helper flushes this bounded, fixed-name marker before JNI entry.
+        // Do not add prompts, outputs, image details, paths, or exception messages.
+        AppDiagnostics.event("inference_stage_start", mapOf("phase" to phase))
+        try {
+            val result = action()
+            AppDiagnostics.event("inference_stage_end", mapOf(
+                "phase" to phase,
+                "duration_ms" to ((System.nanoTime() - started) / 1_000_000L).toString(),
+            ))
+            return result
+        } catch (cancelled: CancellationException) {
+            AppDiagnostics.event("inference_stage_end", mapOf("phase" to phase))
+            throw cancelled
+        } catch (error: Throwable) {
+            AppDiagnostics.event("inference_stage_fail", mapOf("phase" to phase))
+            AppDiagnostics.failure("inference_stage_fail", error)
+            if (error is Exception) {
+                throw IllegalStateException("$label failed: ${error.message?.take(300) ?: error.javaClass.simpleName}", error)
+            }
+            throw error
+        }
+    }
+
+    /** All logging fields come from this fixed internal allowlist, never model data. */
+    private fun diagnosticPhase(label: String): String = when (label) {
+        "SDK initialization" -> "sdk_initialization"
+        "Text model initialization" -> "text_model_initialization"
+        "Multimodal model initialization" -> "multimodal_model_initialization"
+        "Text chat template initialization" -> "text_template_initialization"
+        "Multimodal chat template initialization" -> "multimodal_template_initialization"
+        "Text conversation reset" -> "text_conversation_reset"
+        "Multimodal conversation reset" -> "multimodal_conversation_reset"
+        "Multimodal context reset" -> "multimodal_context_reset"
+        "Text chat template" -> "text_template"
+        "Image chat template" -> "image_template"
+        "Text generation" -> "text_generation"
+        "Image generation" -> "image_generation"
+        else -> "model_load"
     }
 
     private suspend fun collectOutput(
         flow: Flow<LlmStreamResult>,
+        measurements: InferenceMeasurements,
         onToken: (String) -> Unit,
     ): String {
         val answer = StringBuilder()
@@ -320,10 +385,16 @@ class LocalInference(context: Context) : Closeable {
         flow.buffer(Channel.UNLIMITED).collect { event ->
             when (event) {
                 is LlmStreamResult.Token -> {
+                    measurements.observeText(event.text)
                     answer.append(event.text)
                     if (event.text.isNotEmpty()) onToken(event.text)
                 }
-                is LlmStreamResult.Completed -> completed = true
+                is LlmStreamResult.Completed -> {
+                    // This is the SDK's actual native counter, never a count of
+                    // callback chunks or an estimate from output length.
+                    measurements.observeGeneratedTokens(event.profile.generatedTokens)
+                    completed = true
+                }
                 is LlmStreamResult.Error -> throw event.throwable
             }
         }
@@ -387,6 +458,47 @@ class LocalInference(context: Context) : Closeable {
                 mutex.withLock { destroyModels() }
             } finally {
                 nativeScope.cancel()
+            }
+        }
+    }
+}
+
+/** Counts only timing and amounts. No prompt, delta, or answer is retained here. */
+internal class InferenceMeasurements(
+    private val inferenceId: Long,
+    private val visionRequested: Boolean,
+    private val nanoTime: () -> Long = System::nanoTime,
+) {
+    private val started = nanoTime()
+    private val firstTextAt = AtomicLong(Long.MIN_VALUE)
+    private val outputChars = AtomicLong(0)
+    private val generatedTokens = AtomicLong(-1)
+
+    fun observeText(delta: String) {
+        if (delta.isEmpty()) return
+        firstTextAt.compareAndSet(Long.MIN_VALUE, nanoTime())
+        outputChars.addAndGet(delta.codePointCount(0, delta.length).toLong())
+    }
+
+    fun observeGeneratedTokens(count: Long) {
+        if (count >= 0) generatedTokens.set(count)
+    }
+
+    fun fields(): Map<String, String> {
+        val elapsed = (nanoTime() - started).coerceAtLeast(1L)
+        val characters = outputChars.get()
+        return buildMap {
+            put("inference_id", inferenceId.toString())
+            put("vision_requested", visionRequested.toString())
+            put("duration_ms", (elapsed / 1_000_000L).toString())
+            put("output_chars", characters.toString())
+            put("chars_per_second", String.format(Locale.ROOT, "%.2f", characters.toDouble() * 1_000_000_000.0 / elapsed))
+            val first = firstTextAt.get()
+            if (first != Long.MIN_VALUE) put("first_token_ms", ((first - started).coerceAtLeast(0) / 1_000_000L).toString())
+            val tokens = generatedTokens.get()
+            if (tokens >= 0) {
+                put("generated_tokens", tokens.toString())
+                put("tokens_per_second", String.format(Locale.ROOT, "%.2f", tokens.toDouble() * 1_000_000_000.0 / elapsed))
             }
         }
     }

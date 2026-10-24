@@ -23,6 +23,7 @@ Scope: Android source, file-import paths, local agent execution, model loading, 
 | Vision readiness | A wrapper could exist after projector activation failed | A pinned JNI adapter queries the actual native vision capability; image failures identify their stage and do not masquerade as visual analysis |
 | Export destination | A malicious document-picker result could return a file URI and exploit the app's own write privileges | Save accepts external content-provider URIs only and rejects the app's own FileProvider, including user-qualified authorities |
 | Rich output | Ragged tables could amplify into a large padded grid or Binder clipboard payload | Bounded native formatting, no artificial export grid padding, raw-content fallback, clipboard byte checks/error handling, HTML escaping/CSP, and CSV/TSV formula neutralization |
+| Diagnostics | Unfiltered logs or stack-trace messages could reveal document content or paths | Bounded private technical-stage logs use an allowlisted schema; report collection excludes raw exception messages, prompts/replies, document/image payloads, filenames, paths, and URIs; export is user initiated |
 
 These findings establish concrete resource and trust-boundary gaps. No demonstrated XXE exfiltration or verified current GenieX memory-corruption vulnerability was established during this review.
 
