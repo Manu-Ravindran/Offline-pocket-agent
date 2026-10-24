@@ -26,6 +26,8 @@ class SecurityChecksTest(unittest.TestCase):
     def test_library_network_permission_is_rejected(self):
         text = BASE.replace('<application', '<uses-permission android:name="android.permission.INTERNET"/><application')
         self.assertTrue(any('permission' in x for x in inspect_manifest(text)))
+        sdk23 = text.replace('<uses-permission ', '<uses-permission-sdk-23 ')
+        self.assertTrue(any('permission' in x for x in inspect_manifest(sdk23)))
 
     def test_debuggable_release_is_rejected(self):
         text = BASE.replace('<application ', '<application android:debuggable="true" ')
@@ -47,7 +49,9 @@ class SecurityChecksTest(unittest.TestCase):
         password = 'test-fixture-only-' + 'Z' * 40
         captured = {}
 
-        def upload(method='GET', payload=None):
+        def upload(method='GET', payload=None, history=False):
+            if history:
+                return []
             self.assertEqual('PUT', method)
             self.assertEqual('main', payload['branch'])
             captured['encrypted'] = base64.b64decode(payload['content'])
@@ -65,6 +69,12 @@ class SecurityChecksTest(unittest.TestCase):
                     self.assertTrue(Path(settings['POCKET_SIGNING_STORE_FILE']).is_file())
                     with self.assertRaises(RuntimeError):
                         signing.prepare('incorrect-test-password-' + 'X' * 40)
+
+    def test_deleted_signing_key_is_never_silently_replaced(self):
+        with mock.patch.object(signing, 'get_ciphertext', return_value=None), mock.patch.object(signing, 'api_request', return_value=[{'sha': 'old-key-commit'}]), mock.patch.object(signing, 'run') as commands:
+            with self.assertRaises(RuntimeError):
+                signing.bootstrap('test-only-' + 'X' * 40)
+            commands.assert_not_called()
 
 
 if __name__ == '__main__':

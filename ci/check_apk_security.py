@@ -11,7 +11,7 @@ def inspect_manifest(text, release=False):
     application = root.find("application")
     assert application is not None, "APK application is missing"
     errors = []
-    for permission in root.findall("uses-permission"):
+    for permission in (node for node in root if node.tag.startswith("uses-permission")):
         name = permission.get(ANDROID + "name", "")
         if name.startswith("android.permission."):
             errors.append("Unexpected platform permission: " + name)

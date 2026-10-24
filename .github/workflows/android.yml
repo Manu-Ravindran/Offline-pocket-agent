@@ -91,6 +91,7 @@ jobs:
             "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$release_apk"
           fi
       - name: Upload parallel-install preview
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: pocket-agent-preview
@@ -98,7 +99,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Upload signed release
-        if: env.POCKET_SIGNING_READY == 'true'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && env.POCKET_SIGNING_READY == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: pocket-agent-release
@@ -106,7 +107,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Upload unsigned release for signing setup
-        if: env.POCKET_SIGNING_READY != 'true'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && env.POCKET_SIGNING_READY != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: pocket-agent-release-unsigned

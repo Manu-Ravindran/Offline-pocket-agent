@@ -17,6 +17,7 @@ Scope: Android source, file-import paths, local agent execution, model loading, 
 | Agent output | Unobserved source references and spreadsheet errors could be accepted | Source-ID validation, visible tool failures, decimal totals, refusal of missing caches/error-like values, bounded allowlisted read-only tools |
 | Build/update | Initial APK was debuggable and had an ephemeral signing key | Preview/release debugging disabled; persistent release signing supported using an encrypted key and a GitHub secret; parallel preview protects the old installation |
 | Supply chain | Mutable action tags could select different code over time | Action commit pins, fixed AAR version and checksum, limited workflow permissions and no signing secrets in PR builds |
+| Distribution/manifest checks | PR artifacts could be mistaken for official downloads; SDK-specific permission declarations could evade a narrow check | APK artifacts are published only from trusted main runs; both permission declaration forms are checked; the unneeded exported profile-install receiver is removed |
 
 These findings establish concrete resource and trust-boundary gaps. No demonstrated XXE exfiltration or verified current GenieX memory-corruption vulnerability was established during this review.
 
@@ -27,7 +28,7 @@ These findings establish concrete resource and trust-boundary gaps. No demonstra
 - Documents and model metadata never become shell commands or executable code. Agent actions cannot execute scripts, browse the network, or modify original documents.
 - Untrusted names are display labels, not filesystem paths. Imported files receive private generated directories.
 - Native model loading accepts the exact reviewed artifact pair. Verification proofs live in private preferences and are not imported from model sidecars or documents.
-- Plaintext signing keys/passwords stay in temporary runner files. The repository stores only encrypted key material. Existing keys are never regenerated on password failure.
+- Plaintext signing keys/passwords stay in temporary runner files. The repository stores only encrypted key material. Existing keys are never regenerated on password failure; deleting a previously initialized encrypted key requires recovery from Git history.
 
 ## Remaining risks and device checks
 

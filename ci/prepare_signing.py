@@ -22,12 +22,16 @@ def valid_password(value):
     return len(value) >= 32 and not any(c in value for c in "\r\n\x00")
 
 
-def api_request(method="GET", payload=None):
+def api_request(method="GET", payload=None, history=False):
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise RuntimeError("A valid GitHub repository is required for signing setup.")
     url = f"https://api.github.com/repos/{repository}/contents/{ENCRYPTED_PATH}"
-    if method == "GET":
+    if history:
+        url = f"https://api.github.com/repos/{repository}/commits?" + urllib.parse.urlencode({
+            "path": ENCRYPTED_PATH, "sha": "main", "per_page": 1,
+        })
+    elif method == "GET":
         url += "?ref=main"
     request = urllib.request.Request(
         url, method=method,
@@ -43,7 +47,7 @@ def api_request(method="GET", payload=None):
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        if method == "GET" and error.code == 404:
+        if method == "GET" and not history and error.code == 404:
             return None
         raise RuntimeError(f"Signing-key repository request failed (HTTP {error.code}); no key was replaced.") from None
 
@@ -73,6 +77,11 @@ def bootstrap(password):
     if get_ciphertext() is not None:
         print("The encrypted release key already exists; it will not be regenerated.")
         return
+    history = api_request(history=True)
+    if not isinstance(history, list):
+        raise RuntimeError("Could not verify release signing history; no key was generated.")
+    if history:
+        raise RuntimeError("The release key existed previously. Restore its encrypted file from Git history; it will not be replaced with a new key.")
     with tempfile.TemporaryDirectory(prefix="pocket-signing-") as directory:
         directory = Path(directory)
         password_file = directory / "password"

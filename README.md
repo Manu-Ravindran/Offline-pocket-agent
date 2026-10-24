@@ -14,7 +14,7 @@ Ordinary chat and document questions use one model pass with preselected evidenc
 
 ## Download and install from your phone
 
-Open **Actions → Build Android APK** and select the latest successful run. Under **Artifacts**:
+Open **Actions → Build Android APK**, filter to branch **main**, and select its latest successful push/manual run. Download official APKs only from this repository's main-branch runs. Under **Artifacts**:
 
 - **pocket-agent-preview** is installable alongside the original 0.1 app. Extract the ZIP and install `app-debug.apk`. It is built without debugging access, but uses a temporary development signing key.
 - **pocket-agent-release** is the installable, persistently signed release when signing is configured below.
