@@ -123,19 +123,29 @@ class SettingsUiTest {
     @Test
     @Config(qualifiers = "w393dp-h852dp-port")
     fun selectedProjectorCanBeAppliedToAnAlreadySavedLanguageModel() {
-        val application = RuntimeEnvironment.getApplication()
+        val activity = createActivity()
+        val application = activity.application
+        val model = ViewModelProvider(activity)[PocketChatViewModel::class.java]
         val directory = File(application.filesDir, "models/${UUID.randomUUID()}").apply { mkdirs() }
         val modelFile = File(directory, "model.gguf").apply { writeText("GGUF") }
-        application.getSharedPreferences("pocket_agent", Context.MODE_PRIVATE).edit()
+        assertTrue("The saved-model fixture must exist in the running app's storage", modelFile.isFile)
+        assertTrue("The saved-model fixture preferences must be committed", application
+            .getSharedPreferences("pocket_agent", Context.MODE_PRIVATE).edit().clear()
             .putString("model_path", modelFile.absolutePath)
-            .putString("model_name", "Qwen3.5-4B-Q4_K_M.gguf").commit()
-        val activity = createActivity()
-        val model = ViewModelProvider(activity)[PocketChatViewModel::class.java]
+            .putString("model_name", "Qwen3.5-4B-Q4_K_M.gguf").commit())
+        val saved = model.controller.modelStatus()
+        assertTrue("The running controller must recognize the saved fixture: $saved", saved.modelImported)
+        assertFalse("This scenario must not already have a saved vision file: $saved", saved.projectorImported)
         model.stagedProjector = Uri.parse("content://test.documents/mmproj-F16.gguf")
         assertNull("The large language model must not need to be selected again", model.stagedModel)
+        assertNotNull("A newly selected vision file must be staged", model.stagedProjector)
 
         val dialog = openSettings(activity)
         val decor = dialog.window!!.decorView
+        val shown = model.state.value.modelStatus
+        assertTrue("Settings must refresh the saved language-model status: $shown", shown.modelImported)
+        assertFalse("Settings must not invent an already saved vision file: $shown", shown.projectorImported)
+        assertNotNull("Opening Settings must preserve the selected vision file", model.stagedProjector)
         val apply = text(decor, "Use saved model + selected vision file")
         val scroll = tagged(decor, "settings.scroll") as ScrollView
         val destination = Rect(0, 0, apply.width, apply.height)
@@ -240,7 +250,8 @@ class SettingsUiTest {
 
     private fun text(root: View, value: String): TextView =
         requireNotNull(descendants(root).filterIsInstance<TextView>().firstOrNull { it.text.toString() == value }) {
-            "Missing settings action: $value"
+            "Missing settings action: $value; dialog labels: " + descendants(root).filterIsInstance<TextView>()
+                .joinToString(" | ") { it.text.toString().take(160) }.take(3_000)
         }
 
     private fun descendants(view: View): Sequence<View> = sequence {
