@@ -9,3 +9,7 @@ local.properties
 *.bin
 captures/
 app/libs/*.aar
+__pycache__/
+*.pyc
+*.p12
+*.pfx

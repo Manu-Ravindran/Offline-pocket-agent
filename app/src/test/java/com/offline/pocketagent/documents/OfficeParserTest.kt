@@ -8,6 +8,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.nio.charset.Charset
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -143,9 +144,121 @@ class OfficeParserTest {
         assertEquals("42", OfficeParser().parseXlsx(file, "Absolute.xlsx").sections.single().text)
     }
 
-    private fun workbook(rows: String, target: String = "worksheets/sheet1.xml", styles: String? = null): File = archive("book.xlsx", buildMap {
+    @Test fun `UTF16 document text remains readable after canonical decoding`() {
+        val xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" + wordText("Café résumé")
+        val bytes = byteArrayOf(0xff.toByte(), 0xfe.toByte()) + xml.toByteArray(Charsets.UTF_16LE)
+        val file = archiveBytes("unicode.docx", mapOf("word/document.xml" to bytes))
+        assertEquals("Café résumé", OfficeParser().parseDocx(file, "unicode.docx").sections.single().text)
+    }
+
+    @Test fun `UTF16 entity declarations cannot bypass the declaration check`() {
+        val xml = """<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE document [<!ENTITY secret SYSTEM "file:///data/local/private">]><document>&secret;</document>"""
+        for (charset in listOf(Charsets.UTF_16LE, Charsets.UTF_16BE)) {
+            val prefix = if (charset == Charsets.UTF_16LE) byteArrayOf(0xff.toByte(), 0xfe.toByte()) else byteArrayOf(0xfe.toByte(), 0xff.toByte())
+            val file = archiveBytes("entities.docx", mapOf("word/document.xml" to (prefix + xml.toByteArray(charset))))
+            assertRejected("entity declarations") { OfficeParser().parseDocx(file, "entities.docx") }
+        }
+    }
+
+    @Test fun `UTF32 encoded declarations are rejected before parser encoding sniffing`() {
+        val xml = """<?xml version="1.0" encoding="UTF-32"?><!DOCTYPE document [<!ENTITY secret "expanded">]><document>&secret;</document>"""
+        for (encoding in listOf("UTF-32LE", "UTF-32BE")) {
+            val file = archiveBytes("utf32.docx", mapOf("word/document.xml" to xml.toByteArray(Charset.forName(encoding))))
+            assertRejected("UTF-8 or UTF-16") { OfficeParser().parseDocx(file, "utf32.docx") }
+        }
+    }
+
+    @Test fun `unsupported declared encoding is rejected consistently`() {
+        val xml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>" + wordText("Plain ASCII")
+        val file = archive("encoding.docx", mapOf("word/document.xml" to xml))
+        assertRejected("UTF-8 or UTF-16") { OfficeParser().parseDocx(file, "encoding.docx") }
+    }
+
+    @Test fun `malformed UTF8 cannot be silently replaced before security checks`() {
+        val bytes = wordText("text").toByteArray(Charsets.UTF_8) + byteArrayOf(0xc3.toByte(), 0x28)
+        val file = archiveBytes("invalid.docx", mapOf("word/document.xml" to bytes))
+        assertRejected("invalid text encoding") { OfficeParser().parseDocx(file, "invalid.docx") }
+    }
+
+    @Test fun `repeated worksheet references share an actual decompression budget`() {
+        val workbook = """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="One" r:id="r1"/><sheet name="Two" r:id="r2"/><sheet name="Three" r:id="r3"/></sheets></workbook>"""
+        val relationships = """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="r1" Target="worksheets/sheet.xml"/><Relationship Id="r2" Target="worksheets/sheet.xml"/><Relationship Id="r3" Target="worksheets/sheet.xml"/></Relationships>"""
+        val worksheet = """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>"""
+        val parts = mapOf("xl/workbook.xml" to workbook, "xl/_rels/workbook.xml.rels" to relationships, "xl/worksheets/sheet.xml" to worksheet)
+        val declaredTotal = parts.values.sumOf { it.toByteArray(Charsets.UTF_8).size }.toLong()
+        val file = archive("repeated.xlsx", parts)
+        val parser = OfficeParser(ExtractionLimits(maxZipTotalBytes = declaredTotal + worksheet.length / 2))
+        assertRejected("total decompressed read limit") { parser.parseXlsx(file, "repeated.xlsx") }
+    }
+
+    @Test fun `forged small entry count is checked against real directory headers`() {
+        val file = archive("count.docx", mapOf("word/document.xml" to wordText("one"), "word/header1.xml" to wordText("two")))
+        val bytes = file.readBytes()
+        val end = bytes.size - 22
+        bytes[end + 8] = 1
+        bytes[end + 9] = 0
+        bytes[end + 10] = 1
+        bytes[end + 11] = 0
+        file.writeBytes(bytes)
+        assertRejected("directory is inconsistent") { OfficeParser().parseDocx(file, "count.docx") }
+    }
+
+    @Test fun `deep XML nesting is stopped before exhausting parser resources`() {
+        val xml = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>""" +
+            "<w:span>".repeat(30) + "text" + "</w:span>".repeat(30) + "</w:body></w:document>"
+        val file = archive("deep.docx", mapOf("word/document.xml" to xml))
+        assertRejected("nesting limit") { OfficeParser(ExtractionLimits(maxXmlDepth = 16)).parseDocx(file, "deep.docx") }
+    }
+
+    @Test fun `excess XML nodes and oversized attributes are rejected`() {
+        val nodes = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>""" +
+            "<w:span/>".repeat(50) + "</w:body></w:document>"
+        val nodeFile = archive("nodes.docx", mapOf("word/document.xml" to nodes))
+        assertRejected("node limit") { OfficeParser(ExtractionLimits(maxXmlNodes = 20)).parseDocx(nodeFile, "nodes.docx") }
+        val attributeXml = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p value="${"[".repeat(200)}"/></w:body></w:document>"""
+        val attributeFile = archive("attribute.docx", mapOf("word/document.xml" to attributeXml))
+        assertRejected("attribute exceeds") { OfficeParser(ExtractionLimits(maxXmlAttributeChars = 100)).parseDocx(attributeFile, "attribute.docx") }
+    }
+
+    @Test fun `malformed date formats cannot cause repeated bracket rescanning`() {
+        val styles = """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts><numFmt numFmtId="165" formatCode="${"[".repeat(7_000)}0"/></numFmts><cellXfs><xf numFmtId="165"/></cellXfs></styleSheet>"""
+        val file = workbook("""<row r="1"><c r="A1"><v>25</v></c></row>""", styles = styles)
+        assertEquals("25", OfficeParser().parseXlsx(file, "format.xlsx").sections.single().numericValue)
+    }
+
+    @Test fun `namespace declarations cannot bypass XML attribute budgets`() {
+        val xml = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:extra="${"x".repeat(200)}"><w:body/></w:document>"""
+        val file = archive("namespace.docx", mapOf("word/document.xml" to xml))
+        assertRejected("namespace exceeds") { OfficeParser(ExtractionLimits(maxXmlAttributeChars = 100)).parseDocx(file, "namespace.docx") }
+    }
+
+    @Test fun `oversized worksheet names and cell addresses cannot amplify source metadata`() {
+        val nameFile = workbook("""<row r="1"><c r="A1"><v>1</v></c></row>""", sheetName = "x".repeat(8_000))
+        assertRejected("invalid name") { OfficeParser().parseXlsx(nameFile, "name.xlsx") }
+        val referenceFile = workbook("""<row r="1"><c r="${"A".repeat(8_000)}"><v>1</v></c></row>""")
+        assertRejected("A1 cell address") { OfficeParser().parseXlsx(referenceFile, "reference.xlsx") }
+    }
+
+    @Test fun `cell references must be within Excel bounds and unique`() {
+        for (reference in listOf("XFE1", "XFD1048577", "A0", "AAAA1")) {
+            val file = workbook("""<row r="1"><c r="$reference"><v>1</v></c></row>""")
+            assertRejected("cell address") { OfficeParser().parseXlsx(file, "reference.xlsx") }
+        }
+        val duplicate = workbook("""<row r="1"><c r="A1"><v>1</v></c><c r="a1"><v>2</v></c></row>""")
+        assertRejected("duplicate cell addresses") { OfficeParser().parseXlsx(duplicate, "duplicate.xlsx") }
+        val edge = workbook("""<row r="1048576"><c r="xfd1048576"><v>7</v></c></row>""")
+        assertEquals("'Finance & Ops'!XFD1048576", OfficeParser().parseXlsx(edge, "edge.xlsx").sections.single().locator)
+    }
+
+    private fun assertRejected(message: String, block: () -> Unit) {
+        val error = runCatching(block).exceptionOrNull()
+        assertTrue("Expected IllegalArgumentException containing '$message', got $error", error is IllegalArgumentException)
+        assertTrue("Expected '$message', got '${error?.message}'", error!!.message!!.contains(message))
+    }
+
+    private fun workbook(rows: String, target: String = "worksheets/sheet1.xml", styles: String? = null, sheetName: String = "Finance & Ops"): File = archive("book.xlsx", buildMap {
         putAll(mapOf(
-        "xl/workbook.xml" to workbookXml(),
+        "xl/workbook.xml" to workbookXml(sheetName),
         "xl/_rels/workbook.xml.rels" to """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="$target" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/></Relationships>""",
         "xl/sharedStrings.xml" to """<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><r><t>Rev</t></r><r><t>enue</t></r><rPh><t>ignored phonetics</t></rPh></si><si><t>Rent</t></si><si><t>123</t></si></sst>""",
         "xl/worksheets/sheet1.xml" to """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>$rows</sheetData></worksheet>""",
@@ -153,17 +266,22 @@ class OfficeParserTest {
         if (styles != null) put("xl/styles.xml", styles)
     })
 
-    private fun workbookXml() = """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Finance &amp; Ops" sheetId="1" r:id="rId1"/></sheets></workbook>"""
+    private fun workbookXml(name: String = "Finance & Ops"): String {
+        val escaped = name.replace("&", "&amp;").replace("\"", "&quot;").replace("<", "&lt;")
+        return """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="$escaped" sheetId="1" r:id="rId1"/></sheets></workbook>"""
+    }
 
     private fun wordText(text: String) = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>$text</w:t></w:r></w:p></w:body></w:document>"""
 
-    private fun archive(name: String, parts: Map<String, String>): File {
+    private fun archive(name: String, parts: Map<String, String>): File = archiveBytes(name, parts.mapValues { it.value.toByteArray(Charsets.UTF_8) })
+
+    private fun archiveBytes(name: String, parts: Map<String, ByteArray>): File {
         val directory = temporaryFolder.newFolder()
         val file = File(directory, name)
         ZipOutputStream(file.outputStream()).use { zip ->
-            parts.forEach { (path, text) ->
+            parts.forEach { (path, bytes) ->
                 zip.putNextEntry(ZipEntry(path))
-                zip.write(text.toByteArray(Charsets.UTF_8))
+                zip.write(bytes)
                 zip.closeEntry()
             }
         }

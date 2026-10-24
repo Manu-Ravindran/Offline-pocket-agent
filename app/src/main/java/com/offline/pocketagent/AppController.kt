@@ -10,13 +10,15 @@ import android.provider.OpenableColumns
 import com.offline.pocketagent.documents.DocumentExtractor
 import com.offline.pocketagent.documents.DocumentSection
 import com.offline.pocketagent.documents.ExtractedDocument
+import com.offline.pocketagent.documents.ImageDecodeLimits
 import com.offline.pocketagent.inference.ChatMessage
 import com.offline.pocketagent.inference.LocalInference
+import com.offline.pocketagent.security.TrustedModelPolicy
 import java.io.File
 import java.util.UUID
-import kotlin.math.max
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -25,16 +27,18 @@ import org.json.JSONObject
 import kotlin.coroutines.coroutineContext
 
 /** Imports are copied to private storage and processed locally. The original files are never modified. */
-class AppController(context: Context, private val onStatus: (String) -> Unit) {
+class AppController(context: Context, private val onStatus: (String) -> Unit = {}) {
     private val app = context.applicationContext
     private val documentsRoot = File(app.filesDir, "documents").apply { mkdirs() }
     private val modelsRoot = File(app.filesDir, "models").apply { mkdirs() }
     private val preferences = app.getSharedPreferences("pocket_agent", Context.MODE_PRIVATE)
     private val inference = LocalInference(app)
     private val mutex = Mutex()
+    private val conversation = mutableListOf<ConversationTurn>()
+    @Volatile private var activeOperation: Job? = null
 
     suspend fun importDocument(uri: Uri): ImportedDocument = mutex.withLock {
-        withContext(Dispatchers.IO) {
+        withActiveOperation {
             require((documentsRoot.listFiles()?.count { File(it, "document.json").isFile } ?: 0) < MAX_DOCUMENTS) {
                 "This first version stores up to $MAX_DOCUMENTS documents. Clear app storage to start a new library."
             }
@@ -45,7 +49,7 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
             check(directory.mkdir()) { "A document folder could not be created. Please try importing again." }
             try {
                 val copy = copyFromUri(uri, File(directory, "original"), MAX_DOCUMENT_BYTES)
-                val extracted = DocumentExtractor().extract(copy, name, app.contentResolver.getType(uri))
+                val extracted = DocumentExtractor(context = app).extract(copy, name, app.contentResolver.getType(uri))
                 val entry = LibraryDocument(id, extracted)
                 writeDocument(File(directory, "document.json"), entry)
                 entry.toImported()
@@ -57,11 +61,11 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
     }
 
     suspend fun listDocuments(): List<ImportedDocument> = mutex.withLock {
-        withContext(Dispatchers.IO) { readLibrary().map { it.toImported() } }
+        withActiveOperation { readLibrary().map { it.toImported() } }
     }
 
     suspend fun previewDocument(id: String): String = mutex.withLock {
-        withContext(Dispatchers.IO) {
+        withActiveOperation {
             val entry = requireNotNull(readLibrary().firstOrNull { it.id == id }) {
                 "This document could not be reopened. Import it again."
             }
@@ -82,16 +86,22 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
     }
 
     suspend fun configureModel(modelUri: Uri, projectorUri: Uri? = null): String = mutex.withLock {
-        withContext(Dispatchers.IO) {
+        withActiveOperation {
             val directory = File(modelsRoot, UUID.randomUUID().toString()).apply { mkdirs() }
             try {
                 val name = displayName(modelUri)
                 onStatus("Copying $name to private storage. Large models can take a while…")
-                val model = copyFromUri(modelUri, File(directory, "model.gguf"), MAX_MODEL_BYTES)
+                var modelDigest: String? = null
+                val model = copyFromUri(modelUri, File(directory, "model.gguf"), MAX_MODEL_BYTES) { modelDigest = it }
                 requireGguf(model)
+                TrustedModelPolicy(app).verify(model, TrustedModelPolicy.Role.MODEL, modelDigest)
                 val projector = projectorUri?.let {
                     onStatus("Copying the matching vision file…")
-                    copyFromUri(it, File(directory, "mmproj-model.gguf"), MAX_PROJECTOR_BYTES).also(::requireGguf)
+                    var projectorDigest: String? = null
+                    copyFromUri(it, File(directory, "mmproj-model.gguf"), MAX_PROJECTOR_BYTES) { projectorDigest = it }.also { file ->
+                        requireGguf(file)
+                        TrustedModelPolicy(app).verify(file, TrustedModelPolicy.Role.PROJECTOR, projectorDigest)
+                    }
                 }
                 onStatus("Loading the model on this phone…")
                 inference.loadModel(model, projector)
@@ -107,9 +117,31 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
         }
     }
 
-    suspend fun ask(question: String): AgentAnswer = mutex.withLock {
-        withContext(Dispatchers.IO) {
+    fun hasSavedModel(): Boolean = preferences.getString("model_path", null)?.let(::File)?.isFile == true
+
+    suspend fun warmUpSavedModel(): Boolean = mutex.withLock {
+        withActiveOperation {
+            if (inference.isLoaded) true else {
+                val model = preferences.getString("model_path", null)?.let(::File)?.takeIf { it.isFile }
+                if (model == null) false else {
+                    val projector = preferences.getString("projector_path", null)?.let(::File)?.takeIf { it.isFile }
+                    onStatus("Loading your saved local model…")
+                    inference.loadModel(model, projector)
+                    onStatus("Ready. ${modelSummary()}")
+                    true
+                }
+            }
+        }
+    }
+
+    suspend fun ask(
+        question: String,
+        documentIds: List<String>? = null,
+        onPartial: (String) -> Unit = {},
+    ): AgentAnswer = mutex.withLock {
+        withActiveOperation {
             require(question.isNotBlank()) { "Enter a question first." }
+            require(question.length <= 2_000) { "Please keep your question under 2,000 characters." }
             if (!inference.isLoaded) {
                 val model = preferences.getString("model_path", null)?.let(::File)
                 require(model?.isFile == true) { "Choose and load a local GGUF model first. Document import and OCR already work without one." }
@@ -117,17 +149,25 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
                 onStatus("Loading your saved local model…")
                 inference.loadModel(model, projector)
             }
-            AgentEngine(
+            val library = readLibrary().let { all ->
+                if (documentIds.isNullOrEmpty()) all else {
+                    require(documentIds.all { id -> all.any { it.id == id } }) { "An attached document could not be reopened. Import it again." }
+                    all.filter { it.id in documentIds }
+                }
+            }
+            val engine = AgentEngine(
                 generate = { prompt, image ->
-                    val prepared = image?.let(::prepareVisionImage)
-                    try {
-                        inference.generate(listOf(ChatMessage("user", prompt)), prepared)
-                    } finally {
-                        prepared?.delete()
-                    }
+                    runInference(prompt, image, maxTokens = 256)
                 },
                 onStatus = onStatus,
-            ).answer(question.trim(), readLibrary(), inference.isVisionEnabled)
+                streamGenerate = { prompt, image, maximum, onDelta ->
+                    runInference(prompt, image, maximum, onDelta)
+                },
+            )
+            val result = engine.respond(question.trim(), library, inference.isVisionEnabled, onPartial, conversation.takeLast(6))
+            conversation += ConversationTurn(question.take(1_000), result.text.take(2_000))
+            while (conversation.size > 6) conversation.removeAt(0)
+            result
         }
     }
 
@@ -135,23 +175,68 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
         val name = preferences.getString("model_name", null)
         return when {
             inference.isLoaded -> "${name ?: "Local model"} is loaded${if (inference.isVisionEnabled) " with vision" else " for text and OCR"}."
-            name != null -> "$name is saved and will load when you ask a question."
+            name != null && hasSavedModel() -> "$name is saved and loads automatically when the app opens."
             else -> "No model loaded. Choose a GGUF model to enable answers."
         }
     }
 
-    fun close() = inference.close()
+    fun cancelGeneration() {
+        activeOperation?.cancel(CancellationException("Cancelled by the user."))
+    }
+
+    fun clearConversation() {
+        check(activeOperation == null) { "Wait for the current operation to finish before starting a new conversation." }
+        conversation.clear()
+    }
+
+    fun close() {
+        cancelGeneration()
+        inference.close()
+    }
+
+    private suspend fun <T> withActiveOperation(block: suspend () -> T): T = withContext(Dispatchers.IO) {
+        val job = coroutineContext[Job]
+        activeOperation = job
+        try {
+            block()
+        } finally {
+            if (activeOperation === job) activeOperation = null
+        }
+    }
+
+    private suspend fun runInference(
+        prompt: String,
+        image: File?,
+        maxTokens: Int,
+        onDelta: ((String) -> Unit)? = null,
+    ): String {
+        val prepared = image?.let(::prepareVisionImage)
+        return try {
+            inference.generate(listOf(ChatMessage("user", prompt)), prepared, onDelta, maxTokens)
+        } finally {
+            prepared?.delete()
+        }
+    }
 
     private fun prepareVisionImage(source: File): File {
+        val header = source.inputStream().use { input ->
+            ByteArray(64).let { buffer -> buffer.copyOf(input.read(buffer).coerceAtLeast(0)) }
+        }
+        require(ImageDecodeLimits.supportsSignature(header)) { "Use a JPEG, PNG, WebP, or HEIF camera image." }
         val dimensions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(source.absolutePath, dimensions)
-        require(dimensions.outWidth > 0 && dimensions.outHeight > 0) { "This image cannot be decoded for vision." }
-        var sample = 1
-        while (max(dimensions.outWidth, dimensions.outHeight) / sample > 1_536) sample *= 2
+        val sample = ImageDecodeLimits.sampleSize(dimensions.outWidth, dimensions.outHeight, 1_536)
         val decoded = requireNotNull(BitmapFactory.decodeFile(source.absolutePath, BitmapFactory.Options().apply {
             inSampleSize = sample
+            inScaled = false
             inPreferredConfig = Bitmap.Config.ARGB_8888
         })) { "This image cannot be decoded for vision." }
+        try {
+            ImageDecodeLimits.validateDecoded(decoded.width, decoded.height, decoded.allocationByteCount.toLong(), 1_536)
+        } catch (error: Throwable) {
+            decoded.recycle()
+            throw error
+        }
         val orientation = runCatching {
             ExifInterface(source.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
         }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
@@ -183,36 +268,15 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
         }
     }
 
-    private suspend fun copyFromUri(uri: Uri, destination: File, maximum: Long): File {
+    private suspend fun copyFromUri(uri: Uri, destination: File, maximum: Long, onDigest: ((String) -> Unit)? = null): File {
         val knownSize = app.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
             val index = cursor.getColumnIndex(OpenableColumns.SIZE)
             if (index >= 0 && cursor.moveToFirst() && !cursor.isNull(index)) cursor.getLong(index) else null
         }
-        require(knownSize == null || knownSize <= maximum) { "This file exceeds the ${maximum / (1024 * 1024)} MB import limit." }
-        if (knownSize != null) require(destination.parentFile!!.usableSpace > knownSize + 128L * 1024 * 1024) {
-            "There is not enough free phone storage to copy this file."
-        }
-        val pending = File(destination.parentFile, destination.name + ".part")
-        try {
-            requireNotNull(app.contentResolver.openInputStream(uri)) { "The selected file could not be opened." }.use { input ->
-                pending.outputStream().buffered().use { output ->
-                    val buffer = ByteArray(128 * 1024)
-                    var copied = 0L
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        copied += read
-                        require(copied <= maximum) { "This file exceeds the import size limit." }
-                        output.write(buffer, 0, read)
-                    }
-                    require(copied > 0) { "The selected file is empty." }
-                }
-            }
-            check(pending.renameTo(destination)) { "The imported file could not be saved." }
-            return destination
-        } finally {
-            pending.delete()
+        return requireNotNull(app.contentResolver.openInputStream(uri)) { "The selected file could not be opened." }.use { input ->
+            val receipt = ImportCopier.copy(input, destination, maximum, knownSize, hash = onDigest != null)
+            receipt.sha256?.let { onDigest?.invoke(it) }
+            receipt.file
         }
     }
 

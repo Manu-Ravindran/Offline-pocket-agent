@@ -1,13 +1,11 @@
 package com.offline.pocketagent.documents
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Color
 import android.graphics.Matrix
-import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
-import android.os.Build
-import android.os.ParcelFileDescriptor
+import com.offline.pocketagent.security.PdfSandboxClient
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -18,18 +16,19 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.Executor
 import kotlin.coroutines.coroutineContext
 import kotlin.math.max
-import kotlin.math.roundToInt
 
 /** All document processing stays on-device; the OCR model is bundled in the APK. */
-class DocumentExtractor(private val limits: ExtractionLimits = ExtractionLimits()) {
+class DocumentExtractor(private val context: Context, private val limits: ExtractionLimits = ExtractionLimits()) {
     suspend fun extract(file: File, displayName: String, mimeType: String? = null): ExtractedDocument =
         withContext(Dispatchers.IO) {
             require(file.isFile) { "The selected file could not be opened." }
             require(file.length() <= limits.maxFileBytes) {
                 "This file exceeds the ${limits.maxFileBytes / (1024 * 1024)} MB import limit."
             }
+            coroutineContext.ensureActive()
             val extension = displayName.substringAfterLast('.', "").lowercase(Locale.ROOT)
             val type = mimeType?.lowercase(Locale.ROOT).orEmpty()
             when {
@@ -47,64 +46,8 @@ class DocumentExtractor(private val limits: ExtractionLimits = ExtractionLimits(
             }
         }
 
-    private suspend fun extractPdf(file: File, displayName: String): ExtractedDocument {
-        val output = SectionCollector(limits.maxTextChars)
-        var usedOcr = false
-        try {
-            val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            val renderer = try {
-                PdfRenderer(descriptor)
-            } catch (error: Exception) {
-                descriptor.close()
-                throw error
-            }
-            renderer.use {
-                if (renderer.pageCount > limits.maxPages) {
-                    output.warnings += "Only the first ${limits.maxPages} of ${renderer.pageCount} PDF pages were read."
-                }
-                for (index in 0 until minOf(renderer.pageCount, limits.maxPages)) {
-                    coroutineContext.ensureActive()
-                    if (output.full) break
-                    renderer.openPage(index).use { page ->
-                        val nativeText = if (Build.VERSION.SDK_INT >= 35) {
-                            runCatching { page.textContents.joinToString("\n") { it.text } }.getOrDefault("")
-                        } else ""
-                        val text: String
-                        val kind: String
-                        if (nativeText.isNotBlank()) {
-                            text = nativeText
-                            kind = "pdf_text"
-                        } else {
-                            val scale = limits.maxImageEdge.toDouble() / max(page.width, page.height).coerceAtLeast(1)
-                            val width = (page.width * scale).roundToInt().coerceAtLeast(1)
-                            val height = (page.height * scale).roundToInt().coerceAtLeast(1)
-                            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                            bitmap.eraseColor(Color.WHITE)
-                            try {
-                                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                            } catch (error: Exception) {
-                                bitmap.recycle()
-                                throw error
-                            }
-                            text = recognizeAndRelease(bitmap)
-                            kind = "pdf_ocr"
-                            usedOcr = true
-                        }
-                        if (text.isBlank()) {
-                            output.warnings += "No readable text was found on PDF page ${index + 1}."
-                        } else output.add("page ${index + 1}", text.trim(), kind)
-                    }
-                }
-            }
-        } catch (error: SecurityException) {
-            throw IllegalArgumentException("This PDF is encrypted or password protected. Import an unlocked copy.", error)
-        }
-        if (usedOcr) {
-            output.warnings += "Some PDF text was recognized from page images. Check OCR text against the original before relying on names or numbers."
-        }
-        output.warnings += "PDF extraction reads text; diagrams, charts, and image-only meaning require a vision model."
-        return ExtractedDocument(displayName, "pdf", output.sections, output.warnings.distinct())
-    }
+    private suspend fun extractPdf(file: File, displayName: String): ExtractedDocument =
+        PdfSandboxClient(context).extract(file, displayName, limits)
 
     private suspend fun extractImage(file: File, displayName: String): ExtractedDocument {
         val bitmap = decodeBoundedImage(file)
@@ -117,16 +60,25 @@ class DocumentExtractor(private val limits: ExtractionLimits = ExtractionLimits(
     }
 
     private fun decodeBoundedImage(file: File): Bitmap {
+        val header = file.inputStream().use { input ->
+            ByteArray(64).let { buffer -> buffer.copyOf(input.read(buffer).coerceAtLeast(0)) }
+        }
+        require(ImageDecodeLimits.supportsSignature(header)) { "Use a JPEG, PNG, WebP, or HEIF camera image." }
         val dimensions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, dimensions)
-        require(dimensions.outWidth > 0 && dimensions.outHeight > 0) { "This image format could not be decoded." }
-        var sample = 1
-        while (max(dimensions.outWidth, dimensions.outHeight) / sample > limits.maxImageEdge) sample *= 2
+        val sample = ImageDecodeLimits.sampleSize(dimensions.outWidth, dimensions.outHeight, limits.maxImageEdge)
         val options = BitmapFactory.Options().apply {
             inSampleSize = sample
+            inScaled = false
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
         val decoded = requireNotNull(BitmapFactory.decodeFile(file.absolutePath, options)) { "The selected image could not be decoded." }
+        try {
+            ImageDecodeLimits.validateDecoded(decoded.width, decoded.height, decoded.allocationByteCount.toLong(), limits.maxImageEdge)
+        } catch (error: Throwable) {
+            decoded.recycle()
+            throw error
+        }
         val orientation = runCatching {
             ExifInterface(file.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
         }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
@@ -141,22 +93,32 @@ class DocumentExtractor(private val limits: ExtractionLimits = ExtractionLimits(
             ExifInterface.ORIENTATION_ROTATE_270 -> transform.setRotate(-90f)
         }
         if (transform.isIdentity) return decoded
-        return Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, transform, true).also {
-            if (it !== decoded) decoded.recycle()
+        return try {
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, transform, true).also {
+                if (it !== decoded) decoded.recycle()
+            }
+        } catch (error: Throwable) {
+            decoded.recycle()
+            throw error
         }
     }
 
     private suspend fun recognizeAndRelease(bitmap: Bitmap): String {
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val recognizer = try {
+            TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        } catch (error: Throwable) {
+            bitmap.recycle()
+            throw error
+        }
         val task = try {
             recognizer.process(InputImage.fromBitmap(bitmap, 0))
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
             bitmap.recycle()
             recognizer.close()
             throw error
         }
         // ML Kit tasks can outlive coroutine cancellation. Release only when the task is done.
-        task.addOnCompleteListener {
+        task.addOnCompleteListener(Executor { command -> command.run() }) {
             if (!bitmap.isRecycled) bitmap.recycle()
             recognizer.close()
         }
@@ -167,5 +129,39 @@ class DocumentExtractor(private val limits: ExtractionLimits = ExtractionLimits(
         private const val DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         private const val XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "heic", "heif")
+    }
+}
+
+/** Pure bounds checks are separately testable before invoking Android native decoders. */
+internal object ImageDecodeLimits {
+    private const val MAX_DIMENSION = 32_768
+    private const val MAX_SOURCE_PIXELS = 256_000_000L // Includes Samsung's 200 MP capture mode.
+
+    fun sampleSize(width: Int, height: Int, maxEdge: Int): Int {
+        require(width > 0 && height > 0) { "This image format could not be decoded." }
+        require(width <= MAX_DIMENSION && height <= MAX_DIMENSION && width.toLong() * height <= MAX_SOURCE_PIXELS) {
+            "This image exceeds the supported source dimensions. Resize it before importing."
+        }
+        require(maxEdge > 0)
+        var sample = 1
+        while ((max(width, height).toLong() + sample - 1) / sample > maxEdge) sample *= 2
+        return sample
+    }
+
+    fun validateDecoded(width: Int, height: Int, allocatedBytes: Long, maxEdge: Int) {
+        require(width in 1..maxEdge && height in 1..maxEdge && allocatedBytes in 1..(maxEdge.toLong() * maxEdge * 4)) {
+            "The image decoder exceeded the supported bitmap size. Resize the image before importing."
+        }
+    }
+
+    fun supportsSignature(bytes: ByteArray): Boolean {
+        fun ascii(offset: Int, length: Int): String =
+            if (offset + length <= bytes.size) String(bytes, offset, length, Charsets.US_ASCII) else ""
+        val jpeg = bytes.size >= 3 && bytes[0] == 0xff.toByte() && bytes[1] == 0xd8.toByte() && bytes[2] == 0xff.toByte()
+        val png = bytes.size >= 8 && bytes.copyOfRange(0, 8).contentEquals(byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a))
+        val webp = ascii(0, 4) == "RIFF" && ascii(8, 4) == "WEBP"
+        val heifBrands = setOf("heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1")
+        val heif = ascii(4, 4) == "ftyp" && ((8 until bytes.size - 3 step 4).any { ascii(it, 4) in heifBrands })
+        return jpeg || png || webp || heif
     }
 }

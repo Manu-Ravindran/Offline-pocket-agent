@@ -13,6 +13,7 @@ import com.geniex.sdk.bean.SamplerConfig
 import com.geniex.sdk.bean.VlmChatMessage
 import com.geniex.sdk.bean.VlmContent
 import com.geniex.sdk.bean.VlmCreateInput
+import com.offline.pocketagent.security.TrustedModelPolicy
 import java.io.Closeable
 import java.io.File
 import kotlinx.coroutines.CancellationException
@@ -24,10 +25,12 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -58,20 +61,30 @@ class LocalInference(context: Context) : Closeable {
                 check(!closed) { "The inference session is closed." }
                 requireGguf(modelFile, "Model")
                 projectorFile?.let { requireGguf(it, "Vision projector") }
+                val canonicalModel = modelFile.canonicalFile
+                val canonicalProjector = projectorFile?.canonicalFile
+                require(canonicalProjector == null || canonicalProjector.parentFile == canonicalModel.parentFile) {
+                    "The model and vision projector must be imported together into the same private model folder."
+                }
+                val trust = TrustedModelPolicy(appContext)
+                trust.verify(modelFile, TrustedModelPolicy.Role.MODEL)
+                projectorFile?.let { trust.verify(it, TrustedModelPolicy.Role.PROJECTOR) }
                 destroyModels()
                 initializeSdk()
                 val config = ModelConfig(
                     nCtx = 8192,
                     nThreads = 4,
                     nThreadsBatch = 4,
-                    nBatch = if (projectorFile == null) 512 else 1,
-                    nUBatch = if (projectorFile == null) 128 else 1,
+                    // Both text and vision prefill support batched decode in GenieX
+                    // 0.9.3. A batch of one needlessly serializes long document prompts.
+                    nBatch = 512,
+                    nUBatch = 128,
                     nGpuLayers = 0,
                 )
                 if (projectorFile == null) {
                     llm = LlmWrapper.builder().llmCreateInput(
                         LlmCreateInput(
-                            model_path = modelFile.absolutePath,
+                            model_path = canonicalModel.path,
                             config = config,
                             runtime_id = GenieXSdk.PLUGIN_ID_LLAMA_CPP,
                             compute_unit = ComputeUnitValue.CPU.value,
@@ -80,8 +93,8 @@ class LocalInference(context: Context) : Closeable {
                 } else {
                     vlm = VlmWrapper.builder().vlmCreateInput(
                         VlmCreateInput(
-                            model_path = modelFile.absolutePath,
-                            mmproj_path = projectorFile.absolutePath,
+                            model_path = canonicalModel.path,
+                            mmproj_path = canonicalProjector?.path,
                             config = config,
                             runtime_id = GenieXSdk.PLUGIN_ID_LLAMA_CPP,
                             compute_unit = ComputeUnitValue.CPU.value,
@@ -92,11 +105,22 @@ class LocalInference(context: Context) : Closeable {
             }
         }
 
-    suspend fun generate(messages: List<ChatMessage>, imageFile: File? = null): String =
+    /**
+     * [onToken] receives decoded text deltas on an IO worker. The SDK buffers
+     * incomplete UTF-8 sequences before emitting them; concatenate the strings
+     * directly rather than decoding or splitting them again.
+     */
+    suspend fun generate(
+        messages: List<ChatMessage>,
+        imageFile: File? = null,
+        onToken: ((String) -> Unit)? = null,
+        maxTokens: Int = 512,
+    ): String =
         withContext(Dispatchers.IO) {
             mutex.withLock {
                 check(isLoaded) { "Import and load a GGUF model first." }
                 require(messages.isNotEmpty()) { "A prompt is required." }
+                require(maxTokens in 1..2048) { "The output limit must be between 1 and 2048 tokens." }
                 require(messages.all { it.role in setOf("system", "user", "assistant") }) {
                     "Messages must use system, user, or assistant roles."
                 }
@@ -106,7 +130,12 @@ class LocalInference(context: Context) : Closeable {
                 }
                 // The external scope lets cancellation call stopStream while native generate
                 // occupies a worker thread. Await termination before releasing the model lock.
-                val generation = nativeScope.async { generateLocked(messages, imageFile) }
+                val callerContext = currentCoroutineContext()
+                val generation = nativeScope.async {
+                    generateLocked(messages, imageFile, maxTokens) { delta ->
+                        if (callerContext.isActive) onToken?.invoke(delta)
+                    }
+                }
                 try {
                     generation.await()
                 } catch (cancelled: CancellationException) {
@@ -120,13 +149,21 @@ class LocalInference(context: Context) : Closeable {
             }
         }
 
-    private suspend fun generateLocked(messages: List<ChatMessage>, imageFile: File?): String {
+    private suspend fun generateLocked(
+        messages: List<ChatMessage>,
+        imageFile: File?,
+        maxTokens: Int,
+        onToken: (String) -> Unit,
+    ): String {
         val config = GenerationConfig(
-            maxTokens = 768,
+            maxTokens = maxTokens,
             samplerConfig = SamplerConfig(temperature = 0.2f, topP = 0.8f, topK = 20),
         )
         val vision = vlm
         if (vision != null) {
+            // The VLM backend requires append-only history including its exact last
+            // generation. Agent planner requests are independent prompts, so reset
+            // this context while retaining the loaded model and vision encoder.
             check(vision.reset() == 0) { "Could not reset the vision model." }
             val lastUser = messages.indexOfLast { it.role == "user" }
             require(imageFile == null || lastUser >= 0) { "An image needs a user message." }
@@ -145,27 +182,34 @@ class LocalInference(context: Context) : Closeable {
             )
                 .getOrThrow().formattedText
             val mediaConfig = vision.injectMediaPathsToConfig(formattedMessages, config)
-            return collectOutput(vision.generateStreamFlow(prompt, mediaConfig))
+            return collectOutput(vision.generateStreamFlow(prompt, mediaConfig), onToken)
         }
         val text = checkNotNull(llm) { "No local model is loaded." }
-        check(text.reset() == 0) { "Could not reset the language model." }
+        // The text backend safely reuses common token prefixes and rolls back the
+        // differing suffix itself. Clearing it here would discard useful prefill.
         val prompt = text.applyChatTemplate(
             messages = messages.map { SdkChatMessage(it.role, it.content) }.toTypedArray(),
             tools = null,
             enableThinking = false,
             addGenerationPrompt = true,
         ).getOrThrow().formattedText
-        return collectOutput(text.generateStreamFlow(prompt = prompt, config = config))
+        return collectOutput(text.generateStreamFlow(prompt = prompt, config = config), onToken)
     }
 
-    private suspend fun collectOutput(flow: Flow<LlmStreamResult>): String {
+    private suspend fun collectOutput(
+        flow: Flow<LlmStreamResult>,
+        onToken: (String) -> Unit,
+    ): String {
         val answer = StringBuilder()
         var completed = false
         // The SDK's callback uses trySend; an unbounded, fused channel avoids dropping
         // tokens if Android briefly pauses the consumer while native inference runs.
         flow.buffer(Channel.UNLIMITED).collect { event ->
             when (event) {
-                is LlmStreamResult.Token -> answer.append(event.text)
+                is LlmStreamResult.Token -> {
+                    answer.append(event.text)
+                    if (event.text.isNotEmpty()) onToken(event.text)
+                }
                 is LlmStreamResult.Completed -> completed = true
                 is LlmStreamResult.Error -> throw event.throwable
             }

@@ -10,8 +10,8 @@ android {
         applicationId = "com.offline.pocketagent"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
         ndk { abiFilters += "arm64-v8a" }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -20,15 +20,40 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    buildFeatures { aidl = true }
+    val signingStore = System.getenv("POCKET_SIGNING_STORE_FILE")
+    val signingPasswordFile = System.getenv("POCKET_SIGNING_PASSWORD_FILE")
+    if (!signingStore.isNullOrBlank() && !signingPasswordFile.isNullOrBlank()) {
+        signingConfigs.create("persistentRelease") {
+            storeFile = file(signingStore)
+            storePassword = file(signingPasswordFile).readText().trimEnd('\r', '\n')
+            keyAlias = "pocket-agent"
+            keyPassword = storePassword
+        }
+    }
     buildTypes {
+        debug {
+            isDebuggable = false
+            isJniDebuggable = false
+            applicationIdSuffix = ".preview"
+            versionNameSuffix = "-preview"
+            resValue("string", "app_name", "Pocket Agent Preview")
+        }
         release {
+            isDebuggable = false
+            isJniDebuggable = false
             isMinifyEnabled = false
+            resValue("string", "app_name", "Pocket Agent")
+            if (!signingStore.isNullOrBlank() && !signingPasswordFile.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("persistentRelease")
+            }
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
     packaging {
         jniLibs.useLegacyPackaging = true
-        resources.excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*")
+        resources.excludes += "META-INF/DEPENDENCIES"
+        resources.pickFirsts += setOf("META-INF/LICENSE*", "META-INF/NOTICE*")
     }
     lint { abortOnError = true }
 }
