@@ -41,7 +41,8 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
             val name = displayName(uri)
             onStatus("Importing $name…")
             val id = UUID.randomUUID().toString().substring(0, 8)
-            val directory = File(documentsRoot, id).apply { mkdirs() }
+            val directory = File(documentsRoot, id)
+            check(directory.mkdir()) { "A document folder could not be created. Please try importing again." }
             try {
                 val copy = copyFromUri(uri, File(directory, "original"), MAX_DOCUMENT_BYTES)
                 val extracted = DocumentExtractor().extract(copy, name, app.contentResolver.getType(uri))
