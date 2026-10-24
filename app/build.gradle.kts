@@ -45,3 +45,12 @@ dependencies {
     testImplementation("net.sf.kxml:kxml2:2.3.0")
     testImplementation("org.json:json:20240303")
 }
+
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    testLogging {
+        events("failed", "skipped")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        showCauses = true
+        showStackTraces = true
+    }
+}

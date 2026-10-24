@@ -1,5 +1,6 @@
 package com.offline.pocketagent
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
@@ -46,6 +47,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var stepsLabel: TextView
     private lateinit var stepsText: TextView
     private val controls = mutableListOf<View>()
+    private val documentControls = mutableListOf<View>()
     private var selectedModel: Uri? = null
     private var selectedProjector: Uri? = null
     private var cameraUri: Uri? = null
@@ -299,6 +301,7 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun refreshDocuments() {
         val documents = controller.listDocuments()
+        documentControls.clear()
         fileList.removeAllViews()
         if (documents.isEmpty()) {
             fileList.addView(description("No documents yet. Add a file or take a photo to begin.").apply {
@@ -315,8 +318,29 @@ class MainActivity : ComponentActivity() {
             }
             row.addView(label(document.name, 14, true).apply { setTextIsSelectable(true) })
             row.addView(description(document.summary))
+            row.addView(button("View extracted text", dynamic = true) {
+                runTask("Opening extracted text…") {
+                    val preview = controller.previewDocument(document.id)
+                    showDocumentPreview(document.name, preview)
+                    statusLabel.text = "Preview ready. Check the extracted text before asking questions."
+                }
+            }, fullWidthParams(top = 8))
             fileList.addView(row, fullWidthParams(top = 7))
         }
+    }
+
+    private fun showDocumentPreview(name: String, preview: String) {
+        val text = label(preview, 14).apply {
+            setTextIsSelectable(true)
+            setLineSpacing(dp(4).toFloat(), 1f)
+            setPadding(dp(20), dp(12), dp(20), dp(16))
+        }
+        val scroll = ScrollView(this).apply { addView(text) }
+        AlertDialog.Builder(this)
+            .setTitle(name)
+            .setView(scroll)
+            .setPositiveButton("Close", null)
+            .show()
     }
 
     private fun showAnswer(answer: AgentAnswer) {
@@ -351,7 +375,7 @@ class MainActivity : ComponentActivity() {
 
     private fun setBusy(value: Boolean) {
         busy = value
-        controls.forEach {
+        (controls + documentControls).forEach {
             it.isEnabled = !value
             it.alpha = if (value) .55f else 1f
         }
@@ -419,7 +443,12 @@ class MainActivity : ComponentActivity() {
         parent.addView(row, fullWidthParams(top = 12))
     }
 
-    private fun button(title: String, primary: Boolean = false, onClick: () -> Unit): Button = Button(this).apply {
+    private fun button(
+        title: String,
+        primary: Boolean = false,
+        dynamic: Boolean = false,
+        onClick: () -> Unit
+    ): Button = Button(this).apply {
         text = title
         textSize = 14f
         isAllCaps = false
@@ -434,7 +463,9 @@ class MainActivity : ComponentActivity() {
         )
         setPadding(dp(10), dp(8), dp(10), dp(8))
         setOnClickListener { onClick() }
-        controls += this
+        if (dynamic) documentControls += this else controls += this
+        isEnabled = !busy
+        alpha = if (busy) .55f else 1f
     }
 
     private fun label(value: String, size: Int, bold: Boolean = false): TextView = TextView(this).apply {

@@ -1,6 +1,7 @@
 package com.offline.pocketagent.documents
 
 import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserException
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -332,7 +333,13 @@ class OfficeParser(private val limits: ExtractionLimits = ExtractionLimits()) {
         }
         return XmlPullParserFactory.newInstance().apply { isNamespaceAware = true }
             .newPullParser().apply {
-                setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false)
+                try {
+                    setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false)
+                } catch (_: XmlPullParserException) {
+                    // kXML implementations may not expose this optional feature, even when
+                    // disabling it. DTD and entity declarations were rejected above, before
+                    // any parser sees these bytes; unsupported features cannot enable them.
+                }
                 setInput(ByteArrayInputStream(bytes), null)
             }
     }

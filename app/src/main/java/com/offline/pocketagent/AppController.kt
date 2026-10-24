@@ -60,6 +60,27 @@ class AppController(context: Context, private val onStatus: (String) -> Unit) {
         withContext(Dispatchers.IO) { readLibrary().map { it.toImported() } }
     }
 
+    suspend fun previewDocument(id: String): String = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val entry = requireNotNull(readLibrary().firstOrNull { it.id == id }) {
+                "This document could not be reopened. Import it again."
+            }
+            buildString {
+                append(entry.document.name).append("\n\n")
+                entry.document.warnings.forEach { append(it).append("\n\n") }
+                if (entry.document.sections.isEmpty()) append("No text was extracted from this file.")
+                for ((index, section) in entry.document.sections.withIndex()) {
+                    append("[").append(entry.id).append(":").append(index).append("] ")
+                    append(section.locator).append("\n").append(section.text).append("\n\n")
+                    if (length >= 40_000) {
+                        append("Preview stopped at 40,000 characters. The index may contain additional text.")
+                        break
+                    }
+                }
+            }
+        }
+    }
+
     suspend fun configureModel(modelUri: Uri, projectorUri: Uri? = null): String = mutex.withLock {
         withContext(Dispatchers.IO) {
             val directory = File(modelsRoot, UUID.randomUUID().toString()).apply { mkdirs() }

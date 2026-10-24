@@ -40,7 +40,7 @@ jobs:
             --output app/libs/geniex-android-v0.9.3.aar
           echo '224c81687ca1a24491a6a5c05000eb7af22821f0d1bca251ea6e0e4e9291a3cd  app/libs/geniex-android-v0.9.3.aar' | sha256sum --check
       - name: Test, check, and build
-        run: gradle --no-daemon testDebugUnitTest lintDebug assembleDebug
+        run: gradle --no-daemon --continue testDebugUnitTest lintDebug assembleDebug
       - name: Check offline app permissions
         shell: bash
         run: |

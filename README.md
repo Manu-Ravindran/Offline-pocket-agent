@@ -9,7 +9,7 @@ The app has no Internet permission. GitHub builds the APK online; importing file
 1. Open this repository in your phone's browser and select **Actions → Build Android APK**.
 2. Open the latest successful run. Under **Artifacts**, download **pocket-agent-debug** while signed in to GitHub.
 3. Extract the ZIP in your phone's file manager, then open `app-debug.apk`. Allow installation from that browser or file manager if Android asks.
-4. Open **Pocket Agent**. Add a document or take a picture. Document extraction works before you load an LLM.
+4. Open **Pocket Agent**. Add a document or take a picture. Tap **View extracted text** to check the result. Document extraction works before you load an LLM.
 5. Download a compatible GGUF model using your browser, then choose it under **Your local model**. For visual questions, also select the matching vision projector and tap **Load model**.
 6. Enable airplane mode and try the examples below.
 

@@ -56,7 +56,18 @@ class AgentEngine(
             if (name == "answer") {
                 val answer = action.optString("text").trim().take(8_000)
                 if (answer.isNotBlank()) {
-                    return AgentAnswer(answer, evidence.values.toList(), steps)
+                    val invalidCitations = CITATION_PATTERN.findAll(answer)
+                        .map { it.groupValues[1] }.filter { it !in evidence }.distinct().toList()
+                    if (invalidCitations.isEmpty()) {
+                        return AgentAnswer(answer, sourceLabels(evidence), steps)
+                    }
+                    observations += "Citation error: this answer used unverified references: " +
+                        invalidCitations.joinToString(", ").take(500) + ". " +
+                        "Use only exact source IDs returned by tools: " +
+                        evidence.keys.joinToString(", ").take(1_000).ifBlank { "none yet; search or read a source first" } +
+                        ". Return a corrected answer; never invent document, section, or page IDs."
+                    steps += "Rejected unverified source references."
+                    continue
                 }
             }
             if (finalTurn) break
@@ -94,7 +105,7 @@ class AgentEngine(
         return AgentAnswer(
             "The local model could not finish a supported answer within the action limit. " +
                 "Try a narrower question naming a document, sheet, page, or cell range.",
-            evidence.values.toList(), steps,
+            sourceLabels(evidence), steps,
         )
     }
 
@@ -153,8 +164,12 @@ class AgentEngine(
         evidence["${entry.id}:$index"] = "${entry.document.name} — ${section.locator}"
     }
 
+    private fun sourceLabels(evidence: Map<String, String>): List<String> =
+        evidence.map { (id, label) -> "[$id] $label" }
+
     companion object {
         const val MAX_TOOL_STEPS = 4
+        private val CITATION_PATTERN = Regex("\\[([^\\[\\]\\r\\n]+)\\]")
         internal fun parseAction(text: String): JSONObject? {
             val stripped = text.replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
                 .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
@@ -170,6 +185,7 @@ class AgentEngine(
             {"action":"inspect_image","document_id":"catalog id","question":"visual question"}
             {"action":"answer","text":"answer with [document_id:section] citations"}
             Section indices are zero based. Read evidence before making document claims.
+            Square brackets are reserved for source citations. Use only exact source IDs returned by tools.
             Use sum_cells for spreadsheet totals. Do not mentally calculate totals or invent missing values.
             Stored formulas may have stale cached results. Report relevant extraction limitations.
             Use inspect_image for image contents only when vision is available; OCR alone cannot describe a scene.
@@ -203,8 +219,9 @@ object SpreadsheetMath {
         for (cell in sheetCells) {
             val address = parseCell(cell.locator.removePrefix(prefix))
             if (address.first !in first.first..last.first || address.second !in first.second..last.second) continue
-            require(!Regex("#(DIV/0!|N/A|NAME\\?|NULL!|NUM!|REF!|VALUE!|SPILL!|CALC!)").matches(cell.text)) {
-                "This range contains an Excel error value. Correct it in the workbook before calculating a total."
+            require(!cell.text.trimStart().startsWith("#")) {
+                "This range contains a value starting with '#', which may be an Excel error. " +
+                    "Correct error values or choose a range without this text before calculating an exact total."
             }
             if (cell.isFormula && cell.numericValue == null) {
                 throw IllegalArgumentException("A formula in this range has no numeric cached value. Recalculate and save the workbook in Excel first.")

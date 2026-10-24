@@ -36,9 +36,21 @@ class AgentEngineTest {
     }
 
     @Test fun excelErrorCannotDisappearFromTotal() {
-        assertThrows(IllegalArgumentException::class.java) {
-            SpreadsheetMath.sum(listOf(DocumentSection("'Sales'!A1", "#DIV/0!", "cell")), "Sales", "A1")
+        for (error in listOf("#DIV/0!", "#GETTING_DATA", "#CONNECT!", "#BLOCKED!", "#FIELD!", "#UNKNOWN!", "#BUSY!", "#FUTURE_ERROR!")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                SpreadsheetMath.sum(listOf(
+                    DocumentSection("'Sales'!A1", "10", "cell", "10"),
+                    DocumentSection("'Sales'!A2", error, "cell"),
+                ), "Sales", "A1:A2")
+            }
         }
+    }
+
+    @Test fun hashtagTextHasAnExplicitConservativeRangeError() {
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            SpreadsheetMath.sum(listOf(DocumentSection("'Sales'!A1", "#heading", "cell")), "Sales", "A1")
+        }
+        assertTrue(error.message.orEmpty().contains("choose a range without this text"))
     }
 
     @Test fun outOfBoundsAndReversedRangesAreRejected() {
@@ -60,8 +72,43 @@ class AgentEngineTest {
             "Contract.docx", "docx", listOf(DocumentSection("body paragraph 2", "Delivery is Friday.", "paragraph")),
         ))), false)
         assertEquals(2, calls)
-        assertEquals(listOf("Contract.docx — body paragraph 2"), result.sources)
+        assertEquals(listOf("[doc1:0] Contract.docx — body paragraph 2"), result.sources)
         assertEquals("Delivery is Friday [doc1:0].", result.text)
+    }
+
+    @Test fun fabricatedCitationIsCorrectedUsingObservedEvidence() = runBlocking {
+        var calls = 0
+        val engine = AgentEngine(generate = { prompt, _ ->
+            calls++
+            when (calls) {
+                1 -> """{"action":"search","query":"delivery"}"""
+                2 -> """{"action":"answer","text":"Delivery is Friday [doc1:999] [page 99]."}"""
+                else -> {
+                    assertTrue(prompt.contains("Citation error"))
+                    assertTrue(prompt.contains("source IDs returned by tools: doc1:0"))
+                    """{"action":"answer","text":"Delivery is Friday [doc1:0]."}"""
+                }
+            }
+        })
+        val result = engine.answer("When is delivery?", listOf(LibraryDocument("doc1", ExtractedDocument(
+            "Contract.docx", "docx", listOf(DocumentSection("body paragraph 2", "Delivery is Friday.", "paragraph")),
+        ))), false)
+        assertEquals(3, calls)
+        assertEquals("Delivery is Friday [doc1:0].", result.text)
+        assertTrue(result.steps.contains("Rejected unverified source references."))
+        assertEquals(listOf("[doc1:0] Contract.docx — body paragraph 2"), result.sources)
+    }
+
+    @Test fun repeatedFabricatedCitationsExhaustBudgetWithoutReturningFabrication() = runBlocking {
+        var calls = 0
+        val result = AgentEngine(generate = { _, _ ->
+            calls++
+            """{"action":"answer","text":"Unsupported assertion [invented:123]."}"""
+        }).answer("Read a document", emptyList(), false)
+        assertEquals(AgentEngine.MAX_TOOL_STEPS + 1, calls)
+        assertFalse(result.text.contains("invented:123"))
+        assertTrue(result.text.contains("action limit"))
+        assertTrue(result.sources.isEmpty())
     }
 
     @Test fun unknownToolNeverExecutesAndBudgetTerminates() = runBlocking {
